@@ -1,0 +1,9147 @@
+<?xml version="1.0" encoding="utf-8"?>
+<!DOCTYPE nta PUBLIC '-//Uppaal Team//DTD Flat System 1.6//EN' 'http://www.it.uu.se/research/group/darts/uppaal/flat-1_6.dtd'>
+<nta>
+	<declaration>// ============================================
+// STOCHASTIC VERSION — extension of the Symbolic model (spec §4)
+// ============================================
+// Reuses unchanged the whole symbolic environment: the 18x13 grid, the
+// per-row-offset lane movement, the floating objects, the diving-turtle
+// cycle and the GameManager. On top of that it adds the stochastic features
+// required by Section 4 of the specification:
+//   1. Frogger moves in all four directions with probability weights
+//      up 5/10, down 1/10, left 2/10, right 2/10.
+//   2. Frogger is FORCED to move every time unit as soon as the 2-second
+//      countdown elapses (no idle location).
+//   3. The trucks (row 5) move with a non-deterministic exponential delay
+//      of rate lambda = 1/speed (Uppaal exponentialrate, r:q form).
+//   4. Statistical Model Checking queries (Pr up to 1000 t.u., simulate).
+// DTD is flat-1_5 (Uppaal SMC).
+
+// ============================================
+// GLOBAL CONSTANTS
+// ============================================
+
+const int COLS = 18;
+const int ROWS = 13;
+const int VIRTUAL_W = 20;
+
+const int SAFE = 0;
+const int ROAD = 1;
+const int WATER = 2;
+const int HOME = 3;
+const int DEADLY = 4;
+
+const int LOG_TYPE = 0;
+const int TURTLE_TYPE = 1;
+
+const int EMERGED = 0;
+const int DIVING_STATE = 1;
+const int SUBMERGED_STATE = 2;
+const int EMERGING_STATE = 3;
+
+const int div_duration[4] = {10, 5, 10, 5};
+
+const int LEFT = -1;
+const int RIGHT = 1;
+
+// Bounds of the map row bands. Used by getCellType and submergeFrogger to
+// avoid scattered numeric literals in the code (bonus rule, spec §6).
+const int SAFE_ROW_LOW = 0;
+const int SAFE_ROW_MID = 6;
+const int ROAD_ROW_MIN = 1;
+const int ROAD_ROW_MAX = 5;
+const int WATER_ROW_MIN = 7;
+const int WATER_ROW_MAX = 11;
+const int HOME_ROW = 12;
+
+const int DEATH_NONE = 0;
+const int DEATH_VEHICLE = 1;
+const int DEATH_WATER = 2;
+const int DEATH_SUBMERGED_TURTLE = 3;
+const int DEATH_TIMEOUT = 4;
+const int DEATH_DEADLY_CELL = 5;
+
+const int N_VEHICLES = 12;
+const int N_FLOATING = 11;
+const int N_DIVING = 5;
+const int N_BAYS = 5;
+
+const int FROG_WAIT = 20;         // 2-second start countdown (Assumption 1).
+const int FROG_FORCE_MOVE = 1;    // forced move every time unit (spec §4).
+const int FROG_MIN_MOVE = 1;      // Zeno lower bound (Assumption 2), kept for parity.
+const int INITIAL_LIVES = 5;
+const int FROG_START_X = 9;
+const int FROG_START_Y = 0;
+const int BASE_TIMEOUT = 300;
+
+// Strategy switch for SMC query II (spec §4.II "alternative movement strategy").
+//   false = baseline random walk (used by query I);
+//   true  = goal-biased safe-hop policy: canMoveTo() refuses unsafe cells
+//           (vehicle-covered, open water, deadly) AND a refused non-up hop
+//           falls back to frogMoveUp(), so the frog always attempts to
+//           progress toward the home row when its chosen direction is blocked.
+//           A behavioural bias towards safer rows / toward the goal, in the
+//           spirit of the spec's heuristic examples.
+// Toggle this constant in the declarations before running a query.
+const bool SMART_HEURISTIC = true;
+
+// High-level events between Frogger and GameManager.
+urgent broadcast chan frog_died;
+urgent broadcast chan frog_home;
+
+// Static definitions of moving objects. The row is an immutable membership
+// of the lane, NOT a dynamic coordinate. The current horizontal position is
+// derived as baseX + row_offset[row].
+typedef struct {
+    int baseX;
+    int row;
+    int size;
+} VehicleDef;
+
+typedef struct {
+    int baseX;
+    int row;
+    int size;
+    int kind;
+} FloatingDef;
+
+typedef struct {
+    int baseX;
+    int row;
+} DivingDef;
+
+const VehicleDef vehicles[N_VEHICLES] = {
+    {4,1,1}, {14,1,1},
+    {2,2,1}, {11,2,1},
+    {4,3,1}, {8,3,1}, {13,3,1}, {17,3,1},
+    {2,4,1}, {10,4,1},
+    {4,5,2}, {15,5,2}
+};
+
+const FloatingDef floatingObjects[N_FLOATING] = {
+    {5,7,1,TURTLE_TYPE}, {7,7,1,TURTLE_TYPE}, {9,7,1,TURTLE_TYPE},
+    {9,8,3,LOG_TYPE}, {13,8,3,LOG_TYPE}, {17,8,3,LOG_TYPE},
+    {11,9,9,LOG_TYPE},
+    {1,10,1,TURTLE_TYPE}, {3,10,1,TURTLE_TYPE},
+    {5,11,5,LOG_TYPE}, {17,11,5,LOG_TYPE}
+};
+
+const DivingDef divingTurtles[N_DIVING] = {
+    {13,7}, {15,7}, {17,7},
+    {9,10}, {11,10}
+};
+
+// Speed and direction of each lane. Trucks are row 5 (speed 7).
+const int row_speed[ROWS] = {0,3,10,5,4,7,0,6,2,7,2,2,0};
+const int row_dir[ROWS] = {0,LEFT,RIGHT,LEFT,RIGHT,LEFT,0,LEFT,RIGHT,RIGHT,LEFT,RIGHT,0};
+
+int row_offset[ROWS] = {0,0,0,0,0,0,0,0,0,0,0,0,0};
+
+int globalDivState = EMERGED;
+clock globalClock;
+
+int frogX = FROG_START_X;
+int frogY = FROG_START_Y;
+int carried_by_row = -1;
+int last_death_cause = DEATH_NONE;
+bool frogAlive = true;
+
+int lives = INITIAL_LIVES;
+int score = 0;
+int level = 1;
+int baysOccupied = 0;
+bool bayOccupied[N_BAYS] = {false, false, false, false, false};
+
+// Observer variables for the SMC queries (spec §4). They never alter the
+// game logic: level_completed is set once when the first level is cleared;
+// the death counters are incremented by the GameManager on each death.
+bool level_completed = false;
+// SMC query I: set exactly once, at the instant level 1 is completed, iff the
+// score (including the +100 level bonus) is already &gt;= 200. Observer-only.
+bool first_level_with_200 = false;
+int levels_completed = 0;
+int deaths_by_car = 0;
+int deaths_by_water = 0;
+int deaths_by_submerged = 0;
+int deaths_by_timeout = 0;
+int deaths_by_deadly = 0;
+
+// ============================================
+// PURE FUNCTIONS / SHARED PREDICATES
+// (identical to the symbolic version; reused unchanged)
+// ============================================
+
+/**
+ * Classifies cell (x,y) by type: SAFE (safe), ROAD (road), WATER (deadly
+ * water), HOME (home bay) or DEADLY (deadly cell of the bay row).
+ * @param x  column in [0, COLS-1]
+ * @param y  row in [0, ROWS-1]
+ * @return  cell type code (SAFE/ROAD/WATER/HOME/DEADLY)
+ */
+int getCellType(int x, int y) {
+    if (y == SAFE_ROW_LOW || y == SAFE_ROW_MID) return SAFE;
+    if (y &gt;= ROAD_ROW_MIN &amp;&amp; y &lt;= ROAD_ROW_MAX) return ROAD;
+    if (y &gt;= WATER_ROW_MIN &amp;&amp; y &lt;= WATER_ROW_MAX) return WATER;
+    if (y == HOME_ROW) {
+        if (x % 4 == 0 || x % 4 == 1) return HOME;
+        return DEADLY;
+    }
+    return SAFE;
+}
+
+/**
+ * Maps a column x to the index of its home bay (0..4).
+ * Bays occupy the column pairs (0,1),(4,5),(8,9),(12,13),(16,17).
+ * @param x  column in [0, COLS-1]
+ * @return  bay index 0..4, or -1 if x does not belong to any bay
+ */
+int getBayIndex(int x) {
+    if (x == 0 || x == 1) return 0;
+    if (x == 4 || x == 5) return 1;
+    if (x == 8 || x == 9) return 2;
+    if (x == 12 || x == 13) return 3;
+    if (x == 16 || x == 17) return 4;
+    return -1;
+}
+
+/**
+ * Predicate: cell (x,y) is a home bay cell, regardless of whether it is
+ * already occupied.
+ * @param x  column
+ * @param y  row
+ * @return  true if (x,y) is a bay cell, false otherwise
+ */
+bool isHomeCell(int x, int y) {
+    return y == 12 &amp;&amp; getBayIndex(x) &gt;= 0;
+}
+
+/**
+ * Predicate: cell (x,y) is a currently free (occupiable) bay.
+ * @param x  column
+ * @param y  row
+ * @return  true if (x,y) is a not-yet-occupied bay, false otherwise
+ */
+bool isFreeHomeCell(int x, int y) {
+    int bay;
+    bay = getBayIndex(x);
+    return y == 12 &amp;&amp; bay &gt;= 0 &amp;&amp; !bayOccupied[bay];
+}
+
+/**
+ * Current round timeout, in time units. At level k the timeout equals
+ * BASE_TIMEOUT - 20*(k-1) (i.e. 30 - 2*(k-1) seconds), with a minimum of 1.
+ * @return  maximum time of the current round
+ */
+int currentTimeout() {
+    int timeout;
+    timeout = BASE_TIMEOUT - 20 * (level - 1);
+    if (timeout &lt; 1) return 1;
+    return timeout;
+}
+
+/**
+ * Current horizontal coordinate of an object given its immutable baseX and
+ * its row. Derived as baseX + row_offset[row] with wrap-around on VIRTUAL_W.
+ * @param base_x  initial (fixed) column of the object
+ * @param row     row of the object (selects the current offset)
+ * @return  current virtual column in [0, VIRTUAL_W-1]
+ */
+int effective_x(int base_x, int row) {
+    return (base_x + row_offset[row] + VIRTUAL_W) % VIRTUAL_W;
+}
+
+/**
+ * Predicate: a virtual coordinate falls in the visible portion of the map,
+ * i.e. in [0, COLS-1]. Columns [COLS, VIRTUAL_W-1] are the offscreen buffer
+ * for the wrap-around (difficulty B).
+ * @param virtualX  virtual column in [0, VIRTUAL_W-1]
+ * @return  true if the column is on-screen, false otherwise
+ */
+bool isVisible(int virtualX) {
+    return virtualX &gt;= 0 &amp;&amp; virtualX &lt; COLS;
+}
+
+/**
+ * Predicate: Frogger at (x,y) is on a vehicle. Iterates the vehicles of row y
+ * and computes the cells they occupy (with wrap-around and visibility).
+ * @param x  Frogger column
+ * @param y  Frogger row
+ * @return  true if a vehicle covers cell (x,y), false otherwise
+ */
+bool isOnAnyVehicle(int x, int y) {
+    int i;
+    int j;
+    int ex;
+    int cell;
+    for (i = 0; i &lt; N_VEHICLES; i++) {
+        if (vehicles[i].row == y) {
+            ex = effective_x(vehicles[i].baseX, vehicles[i].row);
+            for (j = 0; j &lt; vehicles[i].size; j++) {
+                cell = (ex - row_dir[y] * j + VIRTUAL_W) % VIRTUAL_W;
+                if (isVisible(cell) &amp;&amp; cell == x) return true;
+            }
+        }
+    }
+    return false;
+}
+
+/**
+ * Predicate: Frogger at (x,y) is on a floating object (log, turtle, or
+ * non-submerged diving turtle). Submerged turtles are excluded (Frogger
+ * would fall into the water).
+ * @param x  Frogger column
+ * @param y  Frogger row
+ * @return  true if a floating object covers (x,y), false otherwise
+ */
+bool isOnAnyFloatingObject(int x, int y) {
+    int i;
+    int j;
+    int ex;
+    int cell;
+    for (i = 0; i &lt; N_FLOATING; i++) {
+        if (floatingObjects[i].row == y) {
+            ex = effective_x(floatingObjects[i].baseX, floatingObjects[i].row);
+            for (j = 0; j &lt; floatingObjects[i].size; j++) {
+                cell = (ex - row_dir[y] * j + VIRTUAL_W) % VIRTUAL_W;
+                if (isVisible(cell) &amp;&amp; cell == x) return true;
+            }
+        }
+    }
+    if (globalDivState != SUBMERGED_STATE) {
+        for (i = 0; i &lt; N_DIVING; i++) {
+            if (divingTurtles[i].row == y) {
+                ex = effective_x(divingTurtles[i].baseX, divingTurtles[i].row);
+                if (isVisible(ex) &amp;&amp; ex == x) return true;
+            }
+        }
+    }
+    return false;
+}
+
+/**
+ * Predicate: (x,y) is a safe water cell because it is enclosed between two
+ * turtles of the same group (turtles separated by at most one cell).
+ * Checks that a turtle exists immediately to the left and one immediately
+ * to the right of x (with wrap-around on VIRTUAL_W, the same 20-cell ring
+ * used by effective_x and the carry, so the offscreen buffer columns 18-19
+ * are not collapsed onto the visible seam).
+ * @param x  Frogger column
+ * @param y  Frogger row
+ * @return  true if x lies in the gap of a turtle group, false otherwise
+ */
+bool isBetweenTurtleGroup(int x, int y) {
+    bool hasLeft;
+    bool hasRight;
+    int i;
+    int ex;
+    hasLeft = false;
+    hasRight = false;
+
+    for (i = 0; i &lt; N_FLOATING; i++) {
+        if (floatingObjects[i].row == y &amp;&amp; floatingObjects[i].kind == TURTLE_TYPE) {
+            ex = effective_x(floatingObjects[i].baseX, floatingObjects[i].row);
+            if (isVisible(ex)) {
+                if (((x - ex + VIRTUAL_W) % VIRTUAL_W) == 1) hasLeft = true;
+                if (((ex - x + VIRTUAL_W) % VIRTUAL_W) == 1) hasRight = true;
+            }
+        }
+    }
+
+    if (globalDivState != SUBMERGED_STATE) {
+        for (i = 0; i &lt; N_DIVING; i++) {
+            if (divingTurtles[i].row == y) {
+                ex = effective_x(divingTurtles[i].baseX, divingTurtles[i].row);
+                if (isVisible(ex)) {
+                    if (((x - ex + COLS) % COLS) == 1) hasLeft = true;
+                    if (((ex - x + COLS) % COLS) == 1) hasRight = true;
+                }
+            }
+        }
+    }
+    return hasLeft &amp;&amp; hasRight;
+}
+
+/**
+ * Predicate: cell (x,y) is currently safe for Frogger. SAFE is always safe;
+ * DEADLY never; ROAD safe if no vehicle; WATER safe if on a floating object
+ * or in a turtle-group gap; HOME safe if the bay is free.
+ * @param x  Frogger column
+ * @param y  Frogger row
+ * @return  true if Frogger can stand on (x,y) without dying, false otherwise
+ */
+bool isSafeCell(int x, int y) {
+    int type;
+    type = getCellType(x, y);
+    if (type == SAFE) return true;
+    if (type == DEADLY) return false;
+    if (type == ROAD) return !isOnAnyVehicle(x, y);
+    if (type == WATER) return isOnAnyFloatingObject(x, y) || isBetweenTurtleGroup(x, y);
+    if (type == HOME) return isFreeHomeCell(x, y);
+    return false;
+}
+
+/**
+ * Predicate: Frogger at (x,y) is on a log (type LOG_TYPE). Excludes turtles
+ * and diving turtles. Kept for parity with the symbolic model / introspection.
+ * @param x  Frogger column
+ * @param y  Frogger row
+ * @return  true if a log covers cell (x,y), false otherwise
+ */
+bool isOnLog(int x, int y) {
+    int i;
+    int j;
+    int ex;
+    int cell;
+    for (i = 0; i &lt; N_FLOATING; i++) {
+        if (floatingObjects[i].row == y &amp;&amp; floatingObjects[i].kind == LOG_TYPE) {
+            ex = effective_x(floatingObjects[i].baseX, floatingObjects[i].row);
+            for (j = 0; j &lt; floatingObjects[i].size; j++) {
+                cell = (ex - row_dir[y] * j + VIRTUAL_W) % VIRTUAL_W;
+                if (isVisible(cell) &amp;&amp; cell == x) return true;
+            }
+        }
+    }
+    return false;
+}
+
+/**
+ * Predicate (query II, design invariant): every vehicle, floating object and
+ * diving turtle stays in its predefined row. In the model the row is an
+ * immutable member of the lane, so the property verifies the design.
+ * @return  true if all objects are in their expected rows, false otherwise
+ */
+bool allObjectsStayInRows() {
+    int i;
+    for (i = 0; i &lt; N_VEHICLES; i++) {
+        if (vehicles[i].row &lt; 1 || vehicles[i].row &gt; 5) return false;
+    }
+    for (i = 0; i &lt; N_FLOATING; i++) {
+        if (floatingObjects[i].row &lt; 7 || floatingObjects[i].row &gt; 11) return false;
+    }
+    for (i = 0; i &lt; N_DIVING; i++) {
+        if (divingTurtles[i].row != 7 &amp;&amp; divingTurtles[i].row != 10) return false;
+    }
+    return true;
+}
+
+/**
+ * Predicate (query II, design invariant): every row_offset stays in
+ * [0, VIRTUAL_W-1], guaranteed by the modulo-VIRTUAL_W update.
+ * @return  true if all offsets are valid, false otherwise
+ */
+bool allRowsHaveValidOffsets() {
+    int r;
+    for (r = 0; r &lt; ROWS; r++) {
+        if (row_offset[r] &lt; 0 || row_offset[r] &gt;= VIRTUAL_W) return false;
+    }
+    return true;
+}
+	</declaration>
+	<template>
+		<name>GameManager</name>
+		<declaration>// GameManager centralizes the global rules: lives, bays, score, reset,
+// new levels and the SMC observer counters. Frogger and the environment
+// signal events; the manager applies the consequences on the global state.
+
+/**
+ * Repositions Frogger on the starting cell, brings it back to life and
+ * cancels any floating-object carry. Does not touch lives, score or bays.
+ */
+void resetFrogger() {
+    frogX = FROG_START_X;
+    frogY = FROG_START_Y;
+    frogAlive = true;
+    carried_by_row = -1;
+}
+
+/**
+ * Handles Frogger's death: increments the SMC death counter corresponding to
+ * the recorded cause, decrements the lives and repositions Frogger — but
+ * ONLY if the game continues (lives &gt; 0 after the decrement). On the last
+ * death (lives becomes 0) the frog is left dead so that, once the manager
+ * reaches GameOver, it cannot play a post-game "ghost life" and accrue
+ * further score; it idles out the remaining horizon without scoring.
+ * The timeout and clocks are reset by the caller (Frogger template).
+ */
+void processDeath() {
+    if (last_death_cause == DEATH_VEHICLE) deaths_by_car = deaths_by_car + 1;
+    else if (last_death_cause == DEATH_WATER) deaths_by_water = deaths_by_water + 1;
+    else if (last_death_cause == DEATH_SUBMERGED_TURTLE) deaths_by_submerged = deaths_by_submerged + 1;
+    else if (last_death_cause == DEATH_TIMEOUT) deaths_by_timeout = deaths_by_timeout + 1;
+    else if (last_death_cause == DEATH_DEADLY_CELL) deaths_by_deadly = deaths_by_deadly + 1;
+    lives = lives - 1;
+    if (lives &gt; 0) resetFrogger();
+}
+
+/**
+ * Handles reaching a free bay: occupies it, adds +5 points and, if all bays
+ * are filled, awards +100 points, clears the bays, advances the level and
+ * sets the level_completed / levels_completed observers (SMC query I/II).
+ * Pre: frogX identifies a free bay (bay &gt;= 0), guaranteed by the
+ * isFreeHomeCell guard on the HomeDetected transition.
+ */
+void processHomeBay() {
+    int bay;
+    int i;
+    bay = getBayIndex(frogX);
+
+    bayOccupied[bay] = true;
+    baysOccupied = baysOccupied + 1;
+    score = score + 5;
+
+    if (baysOccupied == N_BAYS) {
+        score = score + 100;
+        for (i = 0; i &lt; N_BAYS; i++) {
+            bayOccupied[i] = false;
+        }
+        baysOccupied = 0;
+        if (level == 1 &amp;&amp; score &gt;= 200) first_level_with_200 = true;
+        level = level + 1;
+        levels_completed = levels_completed + 1;
+        level_completed = true;
+    }
+
+    resetFrogger();
+}</declaration>
+		<location id="id0" x="-160" y="-80">
+			<name x="-170" y="-114">Running</name>
+		</location>
+		<location id="id1" x="100" y="-80">
+			<name x="90" y="-114">Resetting</name>
+			<committed/>
+		</location>
+		<location id="id2" x="320" y="-80">
+			<name x="310" y="-114">GameOver</name>
+		</location>
+		<init ref="id0"/>
+		<transition id="id3">
+			<source ref="id0"/>
+			<target ref="id1"/>
+			<label kind="synchronisation" x="-90" y="-140">frog_died?</label>
+			<label kind="assignment" x="-90" y="-123">processDeath()</label>
+		</transition>
+		<transition id="id4">
+			<source ref="id0"/>
+			<target ref="id1"/>
+			<label kind="synchronisation" x="-80" y="30">frog_home?</label>
+			<label kind="assignment" x="-80" y="47">processHomeBay()</label>
+			<nail x="-60" y="20"/>
+			<nail x="100" y="20"/>
+		</transition>
+		<transition id="id5">
+			<source ref="id1"/>
+			<target ref="id0"/>
+			<label kind="guard" x="-40" y="90">lives &gt; 0</label>
+			<nail x="100" y="80"/>
+			<nail x="-160" y="80"/>
+		</transition>
+		<transition id="id6">
+			<source ref="id1"/>
+			<target ref="id2"/>
+			<label kind="guard" x="170" y="-120">lives &lt;= 0</label>
+		</transition>
+	</template>
+	<template>
+		<name>Frogger</name>
+		<declaration>// Stochastic Frogger. Differences from the symbolic (up-only) Frogger:
+//  - movement is chosen by a probabilistic branchpoint among the four
+//    cardinal directions (weights up 5, down 1, left 2, right 2);
+//  - a move is FORCED every FROG_FORCE_MOVE time units (invariant on
+//    moveClock) once the FROG_WAIT countdown has elapsed — there is no idle;
+//  - the four move functions share a single landing evaluator;
+//  - SMART_HEURISTIC selects the alternative strategy of query II: a
+//    goal-biased safe-hop policy. canMoveTo() refuses unsafe destinations
+//    (vehicles, open water, deadly cells), and a refused non-up hop falls
+//    back to frogMoveUp(), so the frog always tries to progress toward the
+//    home row when its chosen direction is blocked. Baseline (false) keeps
+//    the plain random walk; weights are identical in both strategies.
+clock moveClock;
+clock waitClock;
+clock roundClock;
+
+/**
+ * Predicate: a candidate cell (nx,ny) is a legal destination for a single
+ * hop. Rejects out-of-map coordinates and already-occupied bays. Under the
+ * SMART_HEURISTIC strategy it also rejects unsafe cells (vehicles, open
+ * water, deadly cells), implementing the alternative strategy of query II.
+ * @param nx  candidate column
+ * @param ny  candidate row
+ * @return  true if Frogger may hop to (nx,ny), false otherwise
+ */
+bool canMoveTo(int nx, int ny) {
+    int type;
+    if (nx &lt; 0 || nx &gt;= COLS) return false;
+    if (ny &lt; 0 || ny &gt;= ROWS) return false;
+    type = getCellType(nx, ny);
+    if (type == HOME &amp;&amp; !isFreeHomeCell(nx, ny)) return false;
+    if (SMART_HEURISTIC) {
+        if (type != HOME &amp;&amp; !isSafeCell(nx, ny)) return false;
+    }
+    return true;
+}
+
+/**
+ * Classifies the cell Frogger currently stands on after a hop and updates the
+ * state accordingly: DEADLY and ROAD-with-vehicle = death; WATER = survival
+ * only on a floating object or turtle gap (otherwise death by drowning),
+ * otherwise the frog is carried by this row; other cells are safe. Shared by
+ * all four move functions. Does not move the frog; only evaluates the landing.
+ */
+void evaluateLanding() {
+    int type;
+    type = getCellType(frogX, frogY);
+    if (type == DEADLY) {
+        frogAlive = false;
+        last_death_cause = DEATH_DEADLY_CELL;
+        return;
+    }
+    if (type == ROAD &amp;&amp; isOnAnyVehicle(frogX, frogY)) {
+        frogAlive = false;
+        last_death_cause = DEATH_VEHICLE;
+        return;
+    }
+    if (type == WATER) {
+        if (isOnAnyFloatingObject(frogX, frogY) || isBetweenTurtleGroup(frogX, frogY)) {
+            carried_by_row = frogY;
+        } else {
+            frogAlive = false;
+            last_death_cause = DEATH_WATER;
+            return;
+        }
+    }
+}
+
+/**
+ * Hop one cell up: +1 row, +1 point (only the up direction scores), cancel
+ * the carry, then evaluate the landing. No-op if the cell is not reachable.
+ */
+void frogMoveUp() {
+    int ny;
+    ny = frogY + 1;
+    if (!canMoveTo(frogX, ny)) return;
+    frogY = ny;
+    score = score + 1;
+    carried_by_row = -1;
+    evaluateLanding();
+}
+
+/**
+ * Hop one cell down: -1 row, no score, cancel the carry, evaluate landing.
+ * No-op if the cell is not reachable. Under the SMART_HEURISTIC strategy,
+ * if the down hop is refused the frog falls back to frogMoveUp() (goal-biased
+ * safe-hop policy: always try to progress toward the home row when the chosen
+ * direction is blocked); only the up direction ever scores, so a successful
+ * fallback still awards +1.
+ */
+void frogMoveDown() {
+    int ny;
+    ny = frogY - 1;
+    if (!canMoveTo(frogX, ny)) {
+        if (SMART_HEURISTIC) frogMoveUp();
+        return;
+    }
+    frogY = ny;
+    carried_by_row = -1;
+    evaluateLanding();
+}
+
+/**
+ * Hop one cell left: -1 column, no score, cancel the carry, evaluate landing.
+ * No-op if the cell is not reachable. Under the SMART_HEURISTIC strategy, if
+ * the left hop is refused the frog falls back to frogMoveUp() (goal-biased
+ * safe-hop policy).
+ */
+void frogMoveLeft() {
+    int nx;
+    nx = frogX - 1;
+    if (!canMoveTo(nx, frogY)) {
+        if (SMART_HEURISTIC) frogMoveUp();
+        return;
+    }
+    frogX = nx;
+    carried_by_row = -1;
+    evaluateLanding();
+}
+
+/**
+ * Hop one cell right: +1 column, no score, cancel the carry, evaluate
+ * landing. No-op if the cell is not reachable. Under the SMART_HEURISTIC
+ * strategy, if the right hop is refused the frog falls back to frogMoveUp()
+ * (goal-biased safe-hop policy).
+ */
+void frogMoveRight() {
+    int nx;
+    nx = frogX + 1;
+    if (!canMoveTo(nx, frogY)) {
+        if (SMART_HEURISTIC) frogMoveUp();
+        return;
+    }
+    frogX = nx;
+    carried_by_row = -1;
+    evaluateLanding();
+}</declaration>
+		<location id="id7" x="-360" y="-80">
+			<name x="-390" y="-114">Waiting</name>
+			<label kind="invariant" x="-405" y="-63">waitClock &lt;= FROG_WAIT</label>
+		</location>
+		<location id="id8" x="-80" y="-80">
+			<name x="-105" y="-114">Playing</name>
+			<label kind="invariant" x="-175" y="-63">moveClock &lt;= FROG_FORCE_MOVE &amp;&amp; roundClock &lt;= currentTimeout()</label>
+		</location>
+		<location id="id9" x="-80" y="-330">
+			<name x="-110" y="-364">Eval</name>
+			<committed/>
+		</location>
+		<location id="id10" x="100" y="-330">
+			<name x="70" y="-364">HomeDetected</name>
+			<committed/>
+		</location>
+		<location id="id11" x="100" y="-80">
+			<name x="70" y="-46">DeathDetected</name>
+			<committed/>
+		</location>
+		<location id="id12" x="100" y="160">
+			<name x="70" y="194">TimeoutDetected</name>
+			<committed/>
+		</location>
+		<branchpoint id="id13" x="-80" y="-210"/>
+		<init ref="id7"/>
+		<transition id="id14">
+			<source ref="id7"/>
+			<target ref="id8"/>
+			<label kind="guard" x="-310" y="-130">waitClock &gt;= FROG_WAIT</label>
+			<label kind="assignment" x="-310" y="-113">moveClock = 0, roundClock = 0</label>
+		</transition>
+		<transition id="id15">
+			<source ref="id8"/>
+			<target ref="id13"/>
+			<label kind="guard" x="-70" y="-150">moveClock == FROG_FORCE_MOVE &amp;&amp; frogAlive &amp;&amp; roundClock &lt; currentTimeout()</label>
+		</transition>
+		<transition id="id16">
+			<source ref="id13"/>
+			<target ref="id9"/>
+			<label kind="assignment" x="-150" y="-253">frogMoveUp()</label>
+			<label kind="probability" x="-150" y="-270">5</label>
+		</transition>
+		<transition id="id17">
+			<source ref="id13"/>
+			<target ref="id9"/>
+			<label kind="assignment" x="-150" y="-233">frogMoveDown()</label>
+			<label kind="probability" x="-150" y="-250">1</label>
+		</transition>
+		<transition id="id18">
+			<source ref="id13"/>
+			<target ref="id9"/>
+			<label kind="assignment" x="-150" y="-213">frogMoveLeft()</label>
+			<label kind="probability" x="-150" y="-230">2</label>
+		</transition>
+		<transition id="id19">
+			<source ref="id13"/>
+			<target ref="id9"/>
+			<label kind="assignment" x="-150" y="-193">frogMoveRight()</label>
+			<label kind="probability" x="-150" y="-210">2</label>
+		</transition>
+		<transition id="id20">
+			<source ref="id9"/>
+			<target ref="id10"/>
+			<label kind="guard" x="20" y="-360">frogAlive &amp;&amp; isFreeHomeCell(frogX, frogY)</label>
+		</transition>
+		<transition id="id21">
+			<source ref="id9"/>
+			<target ref="id11"/>
+			<label kind="guard" x="20" y="-200">!frogAlive</label>
+		</transition>
+		<transition id="id22">
+			<source ref="id9"/>
+			<target ref="id8"/>
+			<label kind="guard" x="-260" y="-300">frogAlive &amp;&amp; !isFreeHomeCell(frogX, frogY)</label>
+			<label kind="assignment" x="-260" y="-283">moveClock = 0</label>
+			<nail x="-360" y="-330"/>
+			<nail x="-360" y="-80"/>
+		</transition>
+		<transition id="id23">
+			<source ref="id10"/>
+			<target ref="id7"/>
+			<label kind="synchronisation" x="-145" y="-410">frog_home!</label>
+			<label kind="assignment" x="-145" y="-393">waitClock = 0, moveClock = 0, roundClock = 0</label>
+			<nail x="100" y="-400"/>
+			<nail x="-360" y="-400"/>
+		</transition>
+		<transition id="id24">
+			<source ref="id11"/>
+			<target ref="id7"/>
+			<label kind="synchronisation" x="-145" y="40">frog_died!</label>
+			<label kind="assignment" x="-145" y="57">waitClock = 0, moveClock = 0, roundClock = 0</label>
+			<nail x="100" y="120"/>
+			<nail x="-360" y="120"/>
+		</transition>
+		<transition id="id25">
+			<source ref="id8"/>
+			<target ref="id12"/>
+			<label kind="guard" x="20" y="60">frogAlive &amp;&amp; roundClock &gt;= currentTimeout()</label>
+			<label kind="assignment" x="20" y="77">frogAlive = false, last_death_cause = DEATH_TIMEOUT</label>
+		</transition>
+		<transition id="id26">
+			<source ref="id8"/>
+			<target ref="id11"/>
+			<label kind="guard" x="-300" y="20">!frogAlive</label>
+			<nail x="-200" y="0"/>
+			<nail x="100" y="0"/>
+		</transition>
+		<transition id="id27">
+			<source ref="id12"/>
+			<target ref="id7"/>
+			<label kind="synchronisation" x="-145" y="200">frog_died!</label>
+			<label kind="assignment" x="-145" y="217">waitClock = 0, moveClock = 0, roundClock = 0</label>
+			<nail x="100" y="240"/>
+			<nail x="-360" y="240"/>
+		</transition>
+	</template>
+	<template>
+		<name>VehicleLane</name>
+		<parameter>const int row</parameter>
+		<declaration>// VehicleLane is the deterministic timed agent of the non-truck road rows
+// (rows 1-4). The lane moves all vehicles of the row horizontally by
+// updating the shared offset, then checks whether a vehicle has hit Frogger.
+// Trucks (row 5) are handled by the stochastic TruckLane template instead.
+clock t;
+
+/**
+ * After the lane shift, checks whether a vehicle of the row has run over
+ * Frogger standing on the same row. If so, marks death by vehicle. Called
+ * in the committed location CheckingCollision.
+ */
+void checkCollision() {
+    if (frogY == row &amp;&amp; isOnAnyVehicle(frogX, frogY)) {
+        frogAlive = false;
+        last_death_cause = DEATH_VEHICLE;
+    }
+}</declaration>
+		<location id="id28" x="-200" y="-80">
+			<name x="-210" y="-114">WaitingForShift</name>
+			<label kind="invariant" x="-210" y="-63">t &lt;= row_speed[row]</label>
+		</location>
+		<location id="id29" x="120" y="-80">
+			<name x="110" y="-114">CheckingCollision</name>
+			<committed/>
+		</location>
+		<init ref="id28"/>
+		<transition id="id30">
+			<source ref="id28"/>
+			<target ref="id29"/>
+			<label kind="guard" x="-140" y="-130">t == row_speed[row]</label>
+			<label kind="assignment" x="-140" y="-113">row_offset[row] = (row_offset[row] + row_dir[row] + VIRTUAL_W) % VIRTUAL_W</label>
+		</transition>
+		<transition id="id31">
+			<source ref="id29"/>
+			<target ref="id28"/>
+			<label kind="assignment" x="-30" y="30">checkCollision(), t = 0</label>
+			<nail x="120" y="40"/>
+			<nail x="-200" y="40"/>
+		</transition>
+	</template>
+	<template>
+		<name>TruckLane</name>
+		<parameter>const int row</parameter>
+		<declaration>// TruckLane is the STOCHASTIC timed agent of the truck row (row 5). Per
+// spec §4 the time between two consecutive moves of a truck is an
+// exponential distribution of rate lambda = 1/speed. Uppaal models this with
+// an exponentialrate label on the driving location in the r:q ratio form
+// 1:row_speed[row] (lambda = 1/7 for trucks). The outgoing edge carries the
+// lane shift and is fired after an Exp(1/speed) delay; no clock invariant.
+
+/**
+ * After the lane shift, checks whether a truck of the row has run over
+ * Frogger standing on the same row. If so, marks death by vehicle. Called
+ * in the committed location CheckingCollision.
+ */
+void checkCollision() {
+    if (frogY == row &amp;&amp; isOnAnyVehicle(frogX, frogY)) {
+        frogAlive = false;
+        last_death_cause = DEATH_VEHICLE;
+    }
+}</declaration>
+		<location id="id32" x="-200" y="-80">
+			<name x="-210" y="-114">Driving</name>
+			<label kind="exponentialrate" x="-210" y="-45">1:row_speed[row]</label>
+		</location>
+		<location id="id33" x="120" y="-80">
+			<name x="110" y="-114">CheckingCollision</name>
+			<committed/>
+		</location>
+		<init ref="id32"/>
+		<transition id="id34">
+			<source ref="id32"/>
+			<target ref="id33"/>
+			<label kind="assignment" x="-140" y="-113">row_offset[row] = (row_offset[row] + row_dir[row] + VIRTUAL_W) % VIRTUAL_W</label>
+		</transition>
+		<transition id="id35">
+			<source ref="id33"/>
+			<target ref="id32"/>
+			<label kind="assignment" x="-30" y="30">checkCollision()</label>
+			<nail x="120" y="40"/>
+			<nail x="-200" y="40"/>
+		</transition>
+	</template>
+	<template>
+		<name>FloatingLane</name>
+		<parameter>const int row</parameter>
+		<declaration>// FloatingLane is the timed agent of the river rows. The lane moves
+// logs/turtles by updating the shared offset and, if Frogger is on this row,
+// carries it in the same direction.
+clock t;
+
+/**
+ * After the lane shift, if Frogger is being carried by this row it is moved
+ * horizontally in the lane's direction (with wrap-around on VIRTUAL_W,
+ * difficulty B). If it re-enters the screen on a non-safe cell, it dies by
+ * drowning. Called in the committed location CarryingFrogger.
+ */
+void carryFroggerIfNeeded() {
+    if (carried_by_row != row) return;
+
+    frogX = (frogX + row_dir[row] + VIRTUAL_W) % VIRTUAL_W;
+
+    if (isVisible(frogX) &amp;&amp; !isSafeCell(frogX, frogY)) {
+        frogAlive = false;
+        last_death_cause = DEATH_WATER;
+    }
+}</declaration>
+		<location id="id36" x="-200" y="-80">
+			<name x="-210" y="-114">WaitingForShift</name>
+			<label kind="invariant" x="-210" y="-63">t &lt;= row_speed[row]</label>
+		</location>
+		<location id="id37" x="120" y="-80">
+			<name x="110" y="-114">CarryingFrogger</name>
+			<committed/>
+		</location>
+		<init ref="id36"/>
+		<transition id="id38">
+			<source ref="id36"/>
+			<target ref="id37"/>
+			<label kind="guard" x="-140" y="-130">t == row_speed[row]</label>
+			<label kind="assignment" x="-140" y="-113">row_offset[row] = (row_offset[row] + row_dir[row] + VIRTUAL_W) % VIRTUAL_W</label>
+		</transition>
+		<transition id="id39">
+			<source ref="id37"/>
+			<target ref="id36"/>
+			<label kind="assignment" x="-45" y="30">carryFroggerIfNeeded(), t = 0</label>
+			<nail x="120" y="40"/>
+			<nail x="-200" y="40"/>
+		</transition>
+	</template>
+	<template>
+		<name>DivingCycle</name>
+		<declaration>// DivingCycle explicitly models the global cycle of diving turtles:
+// Emerged -&gt; Diving -&gt; Submerged -&gt; Emerging -&gt; Emerged.
+clock d;
+
+/**
+ * On the global state transition to SUBMERGED, if Frogger is in the river
+ * and riding a diving turtle, it dies by submersion. Otherwise, if it is not
+ * on a floating object or turtle gap, it dies by drowning. Called on the
+ * Diving -&gt; Submerged transition.
+ */
+void submergeFrogger() {
+    int i;
+    bool onDiving;
+    bool safe;
+    int ex;
+
+    if (frogY &gt;= WATER_ROW_MIN &amp;&amp; frogY &lt;= WATER_ROW_MAX) {
+        onDiving = false;
+        for (i = 0; i &lt; N_DIVING; i++) {
+            if (divingTurtles[i].row == frogY) {
+                ex = effective_x(divingTurtles[i].baseX, divingTurtles[i].row);
+                if (isVisible(ex) &amp;&amp; ex == frogX) onDiving = true;
+            }
+        }
+
+        if (onDiving) {
+            frogAlive = false;
+            last_death_cause = DEATH_SUBMERGED_TURTLE;
+        } else {
+            safe = isOnAnyFloatingObject(frogX, frogY) || isBetweenTurtleGroup(frogX, frogY);
+            if (!safe) {
+                frogAlive = false;
+                last_death_cause = DEATH_WATER;
+            }
+        }
+    }
+}</declaration>
+		<location id="id40" x="-330" y="-80">
+			<name x="-340" y="-114">Emerged</name>
+			<label kind="invariant" x="-340" y="-63">d &lt;= div_duration[EMERGED]</label>
+		</location>
+		<location id="id41" x="-110" y="-80">
+			<name x="-120" y="-114">Diving</name>
+			<label kind="invariant" x="-120" y="-63">d &lt;= div_duration[DIVING_STATE]</label>
+		</location>
+		<location id="id42" x="110" y="-80">
+			<name x="100" y="-114">Submerged</name>
+			<label kind="invariant" x="100" y="-63">d &lt;= div_duration[SUBMERGED_STATE]</label>
+		</location>
+		<location id="id43" x="330" y="-80">
+			<name x="320" y="-114">Emerging</name>
+			<label kind="invariant" x="320" y="-63">d &lt;= div_duration[EMERGING_STATE]</label>
+		</location>
+		<init ref="id40"/>
+		<transition id="id44">
+			<source ref="id40"/>
+			<target ref="id41"/>
+			<label kind="guard" x="-290" y="-135">d == div_duration[EMERGED]</label>
+			<label kind="assignment" x="-290" y="-118">globalDivState = DIVING_STATE, d = 0</label>
+		</transition>
+		<transition id="id45">
+			<source ref="id41"/>
+			<target ref="id42"/>
+			<label kind="guard" x="-70" y="-135">d == div_duration[DIVING_STATE]</label>
+			<label kind="assignment" x="-70" y="-118">globalDivState = SUBMERGED_STATE, submergeFrogger(), d = 0</label>
+		</transition>
+		<transition id="id46">
+			<source ref="id42"/>
+			<target ref="id43"/>
+			<label kind="guard" x="150" y="-135">d == div_duration[SUBMERGED_STATE]</label>
+			<label kind="assignment" x="150" y="-118">globalDivState = EMERGING_STATE, d = 0</label>
+		</transition>
+		<transition id="id47">
+			<source ref="id43"/>
+			<target ref="id40"/>
+			<label kind="guard" x="-20" y="90">d == div_duration[EMERGING_STATE]</label>
+			<label kind="assignment" x="-20" y="107">globalDivState = EMERGED, d = 0</label>
+			<nail x="330" y="80"/>
+			<nail x="-330" y="80"/>
+		</transition>
+	</template>
+	<system>// ============================================
+// SYSTEM INSTANCES
+// ============================================
+
+manager = GameManager();
+frogger = Frogger();
+
+// Road rows: rows 1-4 deterministic, row 5 stochastic (trucks).
+road1 = VehicleLane(1);
+road2 = VehicleLane(2);
+road3 = VehicleLane(3);
+road4 = VehicleLane(4);
+truck5 = TruckLane(5);
+
+// River rows
+river7 = FloatingLane(7);
+river8 = FloatingLane(8);
+river9 = FloatingLane(9);
+river10 = FloatingLane(10);
+river11 = FloatingLane(11);
+
+// Global cycle of diving turtles
+diving = DivingCycle();
+
+// ============================================
+// SYSTEM COMPOSITION
+// All SMC queries run on the full system.
+// ============================================
+
+system manager, frogger,
+       road1, road2, road3, road4, truck5,
+       river7, river8, river9, river10, river11,
+       diving;</system>
+	<queries>
+		<query>
+			<formula>Pr[&lt;=1000](&lt;&gt; first_level_with_200)</formula>
+			<comment>I) (SMC, spec §4.I) Estimate the probability that, within 1000 time units, Frogger completes the FIRST level WHILE scoring at least 200 points. The observer flag first_level_with_200 is set exactly once, at the instant level 1 is completed, only if the score (including the +100 level bonus) is already &gt;= 200; this avoids the ambiguity of conjoining a sticky level flag with a monotonic score. Run with SMART_HEURISTIC = false (baseline random walk, the weights given in the spec).</comment>
+			<result outcome="success" type="interval" value="≤ 0.0499441 (95% CI)" timestamp="2026-07-17 15:57:29 +0200">
+				<details>≤ 0.0499441 (95% CI)</details>
+			</result>
+		</query>
+		<query>
+			<formula>simulate [&lt;=2000; 100] { score, lives, level, deaths_by_car, deaths_by_water, levels_completed }</formula>
+			<comment>II) (SMC, spec §4.II) Alternative movement strategy: set SMART_HEURISTIC = true so Frogger refuses to hop onto unsafe cells (bias towards safer rows / avoidance of drowning and vehicles). Simulate 2000 time units over 100 runs and analyze the trajectories of six aspects: points scored, lives left, current level, deaths by car, deaths by drowning, and number of levels completed.</comment>
+			<result outcome="success" type="quality" timestamp="2026-07-17 15:57:35 +0200">
+				<plot title="Simulations (100)" xaxis="time" yaxis="value">
+					<series title="score" type="l" color="0xff0000" encoding="csv">0.0,0.0
+22.0,0.0
+22.0,1.0
+23.0,1.0
+23.0,2.0
+25.0,2.0
+25.0,3.0
+47.0,3.0
+47.0,4.0
+68.0,4.0
+68.0,5.0
+69.0,5.0
+69.0,6.0
+70.0,6.0
+70.0,7.0
+92.0,7.0
+92.0,8.0
+93.0,8.0
+93.0,9.0
+96.0,9.0
+96.0,10.0
+117.0,10.0
+117.0,11.0
+118.0,11.0
+118.0,12.0
+119.0,12.0
+119.0,13.0
+120.0,13.0
+120.0,14.0
+121.0,14.0
+121.0,15.0
+125.0,15.0
+125.0,16.0
+126.0,16.0
+126.0,17.0
+127.0,17.0
+127.0,18.0
+2000.000002,18.0
+					</series>
+					<series title="" type="l" color="0xff0101" encoding="csv">0.0,0.0
+22.0,0.0
+22.0,1.0
+24.0,1.0
+24.0,2.0
+25.0,2.0
+25.0,3.0
+26.0,3.0
+26.0,4.0
+27.0,4.0
+27.0,5.0
+28.0,5.0
+28.0,6.0
+34.0,6.0
+34.0,7.0
+57.0,7.0
+57.0,8.0
+58.0,8.0
+58.0,9.0
+59.0,9.0
+59.0,10.0
+60.0,10.0
+60.0,11.0
+63.0,11.0
+63.0,12.0
+68.0,12.0
+68.0,13.0
+70.0,13.0
+70.0,14.0
+91.0,14.0
+91.0,15.0
+93.0,15.0
+93.0,16.0
+94.0,16.0
+94.0,17.0
+95.0,17.0
+95.0,18.0
+96.0,18.0
+96.0,19.0
+124.0,19.0
+124.0,20.0
+125.0,20.0
+125.0,21.0
+128.0,21.0
+128.0,22.0
+129.0,22.0
+129.0,23.0
+130.0,23.0
+130.0,24.0
+152.0,24.0
+152.0,25.0
+153.0,25.0
+153.0,26.0
+158.0,26.0
+158.0,27.0
+159.0,27.0
+159.0,28.0
+163.0,28.0
+163.0,29.0
+164.0,29.0
+164.0,30.0
+165.0,30.0
+165.0,31.0
+2000.000002,31.0
+					</series>
+					<series title="" type="l" color="0xff0202" encoding="csv">0.0,0.0
+21.0,0.0
+21.0,1.0
+22.0,1.0
+22.0,2.0
+24.0,2.0
+24.0,3.0
+46.0,3.0
+46.0,4.0
+67.0,4.0
+67.0,5.0
+68.0,5.0
+68.0,6.0
+69.0,6.0
+69.0,7.0
+91.0,7.0
+91.0,8.0
+94.0,8.0
+94.0,9.0
+95.0,9.0
+95.0,10.0
+97.0,10.0
+97.0,11.0
+98.0,11.0
+98.0,12.0
+99.0,12.0
+99.0,13.0
+100.0,13.0
+100.0,14.0
+102.0,14.0
+102.0,15.0
+123.0,15.0
+123.0,16.0
+125.0,16.0
+125.0,17.0
+126.0,17.0
+126.0,18.0
+2000.000002,18.0
+					</series>
+					<series title="" type="l" color="0xff0303" encoding="csv">0.0,0.0
+21.0,0.0
+21.0,1.0
+23.0,1.0
+23.0,2.0
+25.0,2.0
+25.0,3.0
+26.0,3.0
+26.0,4.0
+27.0,4.0
+27.0,5.0
+28.0,5.0
+28.0,6.0
+29.0,6.0
+29.0,7.0
+53.0,7.0
+53.0,8.0
+57.0,8.0
+57.0,9.0
+59.0,9.0
+59.0,10.0
+63.0,10.0
+63.0,11.0
+65.0,11.0
+65.0,12.0
+66.0,12.0
+66.0,13.0
+67.0,13.0
+67.0,14.0
+88.0,14.0
+88.0,15.0
+91.0,15.0
+91.0,16.0
+94.0,16.0
+94.0,17.0
+97.0,17.0
+97.0,18.0
+98.0,18.0
+98.0,19.0
+123.0,19.0
+123.0,20.0
+126.0,20.0
+126.0,21.0
+127.0,21.0
+127.0,22.0
+128.0,22.0
+128.0,23.0
+129.0,23.0
+129.0,24.0
+152.0,24.0
+152.0,25.0
+153.0,25.0
+153.0,26.0
+154.0,26.0
+154.0,27.0
+156.0,27.0
+156.0,28.0
+2000.000002,28.0
+					</series>
+					<series title="" type="l" color="0xff0404" encoding="csv">0.0,0.0
+25.0,0.0
+25.0,1.0
+26.0,1.0
+26.0,2.0
+27.0,2.0
+27.0,3.0
+48.0,3.0
+48.0,4.0
+73.0,4.0
+73.0,5.0
+95.0,5.0
+95.0,6.0
+97.0,6.0
+97.0,7.0
+100.0,7.0
+100.0,8.0
+121.0,8.0
+121.0,9.0
+126.0,9.0
+126.0,10.0
+128.0,10.0
+128.0,11.0
+129.0,11.0
+129.0,12.0
+130.0,12.0
+130.0,13.0
+132.0,13.0
+132.0,14.0
+133.0,14.0
+133.0,15.0
+134.0,15.0
+134.0,16.0
+2000.000002,16.0
+					</series>
+					<series title="" type="l" color="0xff0404" encoding="csv">0.0,0.0
+21.0,0.0
+21.0,1.0
+22.0,1.0
+22.0,2.0
+23.0,2.0
+23.0,3.0
+45.0,3.0
+45.0,4.0
+67.54263760033064,4.0
+67.54263760033064,5.0
+68.54263760033064,5.0
+68.54263760033064,6.0
+71.54263760033064,6.0
+71.54263760033064,7.0
+72.54263760033064,7.0
+72.54263760033064,8.0
+73.54263760033064,8.0
+73.54263760033064,9.0
+74.54263760033064,9.0
+74.54263760033064,10.0
+76.54263760033064,10.0
+76.54263760033064,11.0
+100.54263760033064,11.0
+100.54263760033064,12.0
+101.54263760033064,12.0
+101.54263760033064,13.0
+103.54263760033064,13.0
+103.54263760033064,14.0
+104.54263760033064,14.0
+104.54263760033064,15.0
+105.54263760033064,15.0
+105.54263760033064,16.0
+106.54263760033064,16.0
+106.54263760033064,17.0
+129.54263760033064,17.0
+129.54263760033064,18.0
+131.54263760033064,18.0
+131.54263760033064,19.0
+132.54263760033064,19.0
+132.54263760033064,20.0
+137.54263760033064,20.0
+137.54263760033064,21.0
+2000.000002,21.0
+					</series>
+					<series title="" type="l" color="0xff0505" encoding="csv">0.0,0.0
+21.0,0.0
+21.0,1.0
+23.0,1.0
+23.0,2.0
+24.0,2.0
+24.0,3.0
+25.0,3.0
+25.0,4.0
+46.0,4.0
+46.0,5.0
+67.0,5.0
+67.0,6.0
+68.0,6.0
+68.0,7.0
+90.0,7.0
+90.0,8.0
+91.0,8.0
+91.0,9.0
+92.0,9.0
+92.0,10.0
+117.0,10.0
+117.0,11.0
+118.0,11.0
+118.0,12.0
+120.0,12.0
+120.0,13.0
+2000.000002,13.0
+					</series>
+					<series title="" type="l" color="0xff0606" encoding="csv">0.0,0.0
+23.0,0.0
+23.0,1.0
+46.0,1.0
+46.0,2.0
+48.0,2.0
+48.0,3.0
+50.0,3.0
+50.0,4.0
+52.0,4.0
+52.0,5.0
+58.0,5.0
+58.0,6.0
+59.0,6.0
+59.0,7.0
+60.0,7.0
+60.0,8.0
+81.0,8.0
+81.0,9.0
+83.0,9.0
+83.0,10.0
+105.0,10.0
+105.0,11.0
+107.0,11.0
+107.0,12.0
+108.0,12.0
+108.0,13.0
+130.0,13.0
+130.0,14.0
+134.0,14.0
+134.0,15.0
+136.0,15.0
+136.0,16.0
+138.0,16.0
+138.0,17.0
+140.0,17.0
+140.0,18.0
+2000.000002,18.0
+					</series>
+					<series title="" type="l" color="0xff0707" encoding="csv">0.0,0.0
+21.0,0.0
+21.0,1.0
+22.0,1.0
+22.0,2.0
+26.0,2.0
+26.0,3.0
+31.0,3.0
+31.0,4.0
+53.0,4.0
+53.0,5.0
+54.0,5.0
+54.0,6.0
+56.0,6.0
+56.0,7.0
+58.0,7.0
+58.0,8.0
+59.0,8.0
+59.0,9.0
+60.0,9.0
+60.0,10.0
+61.0,10.0
+61.0,11.0
+84.0,11.0
+84.0,12.0
+86.0,12.0
+86.0,13.0
+88.0,13.0
+88.0,14.0
+110.0,14.0
+110.0,15.0
+131.0,15.0
+131.0,16.0
+2000.000002,16.0
+					</series>
+					<series title="" type="l" color="0xff0808" encoding="csv">0.0,0.0
+22.0,0.0
+22.0,1.0
+25.0,1.0
+25.0,2.0
+27.0,2.0
+27.0,3.0
+28.0,3.0
+28.0,4.0
+29.0,4.0
+29.0,5.0
+30.0,5.0
+30.0,6.0
+53.0,6.0
+53.0,7.0
+54.0,7.0
+54.0,8.0
+55.0,8.0
+55.0,9.0
+56.0,9.0
+56.0,10.0
+57.0,10.0
+57.0,11.0
+58.0,11.0
+58.0,12.0
+61.0,12.0
+61.0,13.0
+84.0,13.0
+84.0,14.0
+85.0,14.0
+85.0,15.0
+86.0,15.0
+86.0,16.0
+108.0,16.0
+108.0,17.0
+129.0,17.0
+129.0,18.0
+131.0,18.0
+131.0,19.0
+132.0,19.0
+132.0,20.0
+134.0,20.0
+134.0,21.0
+135.0,21.0
+135.0,22.0
+137.0,22.0
+137.0,23.0
+138.0,23.0
+138.0,24.0
+2000.000002,24.0
+					</series>
+					<series title="" type="l" color="0xff0909" encoding="csv">0.0,0.0
+22.0,0.0
+22.0,1.0
+23.0,1.0
+23.0,2.0
+24.0,2.0
+24.0,3.0
+46.0,3.0
+46.0,4.0
+67.0,4.0
+67.0,5.0
+68.0,5.0
+68.0,6.0
+69.0,6.0
+69.0,7.0
+70.0,7.0
+70.0,8.0
+71.0,8.0
+71.0,9.0
+72.0,9.0
+72.0,10.0
+74.0,10.0
+74.0,11.0
+79.0,11.0
+79.0,12.0
+102.0,12.0
+102.0,13.0
+103.0,13.0
+103.0,14.0
+105.0,14.0
+105.0,15.0
+128.0,15.0
+128.0,16.0
+130.0,16.0
+130.0,17.0
+131.0,17.0
+131.0,18.0
+132.0,18.0
+132.0,19.0
+133.0,19.0
+133.0,20.0
+135.0,20.0
+135.0,21.0
+140.0,21.0
+140.0,22.0
+2000.000002,22.0
+					</series>
+					<series title="" type="l" color="0xff0a0a" encoding="csv">0.0,0.0
+23.0,0.0
+23.0,1.0
+24.0,1.0
+24.0,2.0
+25.0,2.0
+25.0,3.0
+28.0,3.0
+28.0,4.0
+49.48798415879719,4.0
+49.48798415879719,5.0
+50.48798415879719,5.0
+50.48798415879719,6.0
+53.48798415879719,6.0
+53.48798415879719,7.0
+54.48798415879719,7.0
+54.48798415879719,8.0
+55.48798415879719,8.0
+55.48798415879719,9.0
+57.48798415879719,9.0
+57.48798415879719,10.0
+59.48798415879719,10.0
+59.48798415879719,11.0
+60.48798415879719,11.0
+60.48798415879719,12.0
+81.48798415879719,12.0
+81.48798415879719,13.0
+87.48798415879719,13.0
+87.48798415879719,14.0
+89.48798415879719,14.0
+89.48798415879719,15.0
+110.48798415879719,15.0
+110.48798415879719,16.0
+112.48798415879719,16.0
+112.48798415879719,17.0
+115.48798415879719,17.0
+115.48798415879719,18.0
+116.48798415879719,18.0
+116.48798415879719,19.0
+119.48798415879719,19.0
+119.48798415879719,20.0
+120.48798415879719,20.0
+120.48798415879719,21.0
+121.48798415879719,21.0
+121.48798415879719,22.0
+122.48798415879719,22.0
+122.48798415879719,23.0
+124.48798415879719,23.0
+124.48798415879719,24.0
+125.48798415879719,24.0
+125.48798415879719,25.0
+126.48798415879719,25.0
+126.48798415879719,26.0
+148.4879841587972,26.0
+148.4879841587972,27.0
+153.4879841587972,27.0
+153.4879841587972,28.0
+156.4879841587972,28.0
+156.4879841587972,29.0
+157.4879841587972,29.0
+157.4879841587972,30.0
+2000.000002,30.0
+					</series>
+					<series title="" type="l" color="0xff0b0b" encoding="csv">0.0,0.0
+28.0,0.0
+28.0,1.0
+30.0,1.0
+30.0,2.0
+52.0,2.0
+52.0,3.0
+53.0,3.0
+53.0,4.0
+54.0,4.0
+54.0,5.0
+57.0,5.0
+57.0,6.0
+58.0,6.0
+58.0,7.0
+59.0,7.0
+59.0,8.0
+60.0,8.0
+60.0,9.0
+61.0,9.0
+61.0,10.0
+62.0,10.0
+62.0,11.0
+85.0,11.0
+85.0,12.0
+88.0,12.0
+88.0,13.0
+89.0,13.0
+89.0,14.0
+110.0,14.0
+110.0,15.0
+132.0,15.0
+132.0,16.0
+133.0,16.0
+133.0,17.0
+135.0,17.0
+135.0,18.0
+136.0,18.0
+136.0,19.0
+137.0,19.0
+137.0,20.0
+142.0,20.0
+142.0,21.0
+144.0,21.0
+144.0,22.0
+145.0,22.0
+145.0,23.0
+2000.000002,23.0
+					</series>
+					<series title="" type="l" color="0xff0c0c" encoding="csv">0.0,0.0
+21.0,0.0
+21.0,1.0
+25.0,1.0
+25.0,2.0
+28.0,2.0
+28.0,3.0
+30.0,3.0
+30.0,4.0
+32.0,4.0
+32.0,5.0
+34.0,5.0
+34.0,6.0
+36.0,6.0
+36.0,7.0
+37.0,7.0
+37.0,8.0
+60.0,8.0
+60.0,9.0
+62.0,9.0
+62.0,10.0
+64.0,10.0
+64.0,11.0
+87.0,11.0
+87.0,12.0
+88.0,12.0
+88.0,13.0
+89.0,13.0
+89.0,14.0
+90.0,14.0
+90.0,15.0
+100.0,15.0
+100.0,16.0
+103.0,16.0
+103.0,17.0
+125.0,17.0
+125.0,18.0
+126.0,18.0
+126.0,19.0
+127.0,19.0
+127.0,20.0
+128.0,20.0
+128.0,21.0
+129.0,21.0
+129.0,22.0
+130.0,22.0
+130.0,23.0
+131.0,23.0
+131.0,24.0
+158.0,24.0
+158.0,25.0
+160.0,25.0
+160.0,26.0
+2000.000002,26.0
+					</series>
+					<series title="" type="l" color="0xff0c0c" encoding="csv">0.0,0.0
+21.0,0.0
+21.0,1.0
+25.0,1.0
+25.0,2.0
+26.0,2.0
+26.0,3.0
+27.0,3.0
+27.0,4.0
+28.0,4.0
+28.0,5.0
+50.82353332685307,5.0
+50.82353332685307,6.0
+72.82353332685307,6.0
+72.82353332685307,7.0
+73.82353332685307,7.0
+73.82353332685307,8.0
+94.82353332685307,8.0
+94.82353332685307,9.0
+96.82353332685307,9.0
+96.82353332685307,10.0
+97.82353332685307,10.0
+97.82353332685307,11.0
+98.82353332685307,11.0
+98.82353332685307,12.0
+99.82353332685307,12.0
+99.82353332685307,13.0
+100.82353332685307,13.0
+100.82353332685307,14.0
+101.82353332685307,14.0
+101.82353332685307,15.0
+103.82353332685307,15.0
+103.82353332685307,16.0
+104.82353332685307,16.0
+104.82353332685307,17.0
+107.82353332685307,17.0
+107.82353332685307,18.0
+108.82353332685307,18.0
+108.82353332685307,19.0
+130.82353332685307,19.0
+130.82353332685307,20.0
+131.82353332685307,20.0
+131.82353332685307,21.0
+132.82353332685307,21.0
+132.82353332685307,22.0
+2000.000002,22.0
+					</series>
+					<series title="" type="l" color="0xff0d0d" encoding="csv">0.0,0.0
+22.0,0.0
+22.0,1.0
+26.0,1.0
+26.0,2.0
+30.0,2.0
+30.0,3.0
+31.0,3.0
+31.0,4.0
+32.0,4.0
+32.0,5.0
+54.0,5.0
+54.0,6.0
+59.0,6.0
+59.0,7.0
+81.0,7.0
+81.0,8.0
+104.0,8.0
+104.0,9.0
+105.0,9.0
+105.0,10.0
+108.0,10.0
+108.0,11.0
+109.0,11.0
+109.0,12.0
+110.0,12.0
+110.0,13.0
+111.0,13.0
+111.0,14.0
+140.76556048658676,14.0
+140.76556048658676,15.0
+2000.000002,15.0
+					</series>
+					<series title="" type="l" color="0xff0e0e" encoding="csv">0.0,0.0
+25.0,0.0
+25.0,1.0
+30.0,1.0
+30.0,2.0
+33.0,2.0
+33.0,3.0
+34.0,3.0
+34.0,4.0
+56.0,4.0
+56.0,5.0
+57.0,5.0
+57.0,6.0
+58.0,6.0
+58.0,7.0
+59.0,7.0
+59.0,8.0
+61.0,8.0
+61.0,9.0
+62.0,9.0
+62.0,10.0
+64.0,10.0
+64.0,11.0
+65.0,11.0
+65.0,12.0
+86.0,12.0
+86.0,13.0
+87.0,13.0
+87.0,14.0
+88.0,14.0
+88.0,15.0
+90.0,15.0
+90.0,16.0
+91.0,16.0
+91.0,17.0
+93.0,17.0
+93.0,18.0
+95.0,18.0
+95.0,19.0
+119.0,19.0
+119.0,20.0
+123.0,20.0
+123.0,21.0
+126.0,21.0
+126.0,22.0
+150.0,22.0
+150.0,23.0
+152.0,23.0
+152.0,24.0
+153.0,24.0
+153.0,25.0
+154.0,25.0
+154.0,26.0
+2000.000002,26.0
+					</series>
+					<series title="" type="l" color="0xff0f0f" encoding="csv">0.0,0.0
+22.0,0.0
+22.0,1.0
+23.0,1.0
+23.0,2.0
+25.0,2.0
+25.0,3.0
+26.0,3.0
+26.0,4.0
+27.0,4.0
+27.0,5.0
+29.0,5.0
+29.0,6.0
+31.0,6.0
+31.0,7.0
+53.0,7.0
+53.0,8.0
+54.0,8.0
+54.0,9.0
+79.0,9.0
+79.0,10.0
+101.0,10.0
+101.0,11.0
+104.0,11.0
+104.0,12.0
+105.0,12.0
+105.0,13.0
+106.0,13.0
+106.0,14.0
+127.0,14.0
+127.0,15.0
+129.0,15.0
+129.0,16.0
+132.0,16.0
+132.0,17.0
+2000.000002,17.0
+					</series>
+					<series title="" type="l" color="0xff1010" encoding="csv">0.0,0.0
+21.0,0.0
+21.0,1.0
+23.0,1.0
+23.0,2.0
+30.0,2.0
+30.0,3.0
+31.0,3.0
+31.0,4.0
+33.0,4.0
+33.0,5.0
+55.0,5.0
+55.0,6.0
+57.0,6.0
+57.0,7.0
+58.0,7.0
+58.0,8.0
+59.0,8.0
+59.0,9.0
+61.0,9.0
+61.0,10.0
+62.0,10.0
+62.0,11.0
+63.0,11.0
+63.0,12.0
+84.0,12.0
+84.0,13.0
+87.0,13.0
+87.0,14.0
+88.0,14.0
+88.0,15.0
+91.0,15.0
+91.0,16.0
+92.0,16.0
+92.0,17.0
+93.0,17.0
+93.0,18.0
+94.0,18.0
+94.0,19.0
+96.0,19.0
+96.0,20.0
+97.0,20.0
+97.0,21.0
+99.0,21.0
+99.0,22.0
+125.0,22.0
+125.0,23.0
+126.0,23.0
+126.0,24.0
+128.0,24.0
+128.0,25.0
+129.0,25.0
+129.0,26.0
+131.0,26.0
+131.0,27.0
+132.0,27.0
+132.0,28.0
+133.0,28.0
+133.0,29.0
+137.0,29.0
+137.0,30.0
+138.0,30.0
+138.0,31.0
+159.0,31.0
+159.0,32.0
+160.0,32.0
+160.0,33.0
+161.0,33.0
+161.0,34.0
+163.0,34.0
+163.0,35.0
+2000.000002,35.0
+					</series>
+					<series title="" type="l" color="0xff1111" encoding="csv">0.0,0.0
+23.0,0.0
+23.0,1.0
+24.0,1.0
+24.0,2.0
+25.0,2.0
+25.0,3.0
+26.0,3.0
+26.0,4.0
+27.0,4.0
+27.0,5.0
+28.0,5.0
+28.0,6.0
+29.0,6.0
+29.0,7.0
+30.0,7.0
+30.0,8.0
+31.0,8.0
+31.0,9.0
+32.0,9.0
+32.0,10.0
+53.0,10.0
+53.0,11.0
+54.0,11.0
+54.0,12.0
+56.0,12.0
+56.0,13.0
+58.0,13.0
+58.0,14.0
+59.0,14.0
+59.0,15.0
+61.0,15.0
+61.0,16.0
+63.0,16.0
+63.0,17.0
+64.0,17.0
+64.0,18.0
+86.0,18.0
+86.0,19.0
+94.0,19.0
+94.0,20.0
+96.0,20.0
+96.0,21.0
+118.0,21.0
+118.0,22.0
+119.0,22.0
+119.0,23.0
+120.0,23.0
+120.0,24.0
+142.66059897578057,24.0
+142.66059897578057,25.0
+146.6605989757806,25.0
+146.6605989757806,26.0
+147.66059897578057,26.0
+147.66059897578057,27.0
+2000.000002,27.0
+					</series>
+					<series title="" type="l" color="0xff1212" encoding="csv">0.0,0.0
+21.0,0.0
+21.0,1.0
+23.0,1.0
+23.0,2.0
+25.0,2.0
+25.0,3.0
+47.0,3.0
+47.0,4.0
+70.0,4.0
+70.0,5.0
+72.0,5.0
+72.0,6.0
+73.0,6.0
+73.0,7.0
+94.0,7.0
+94.0,8.0
+96.0,8.0
+96.0,9.0
+97.0,9.0
+97.0,10.0
+119.0,10.0
+119.0,11.0
+120.0,11.0
+120.0,12.0
+121.0,12.0
+121.0,13.0
+2000.000002,13.0
+					</series>
+					<series title="" type="l" color="0xff1313" encoding="csv">0.0,0.0
+22.0,0.0
+22.0,1.0
+27.0,1.0
+27.0,2.0
+29.0,2.0
+29.0,3.0
+31.0,3.0
+31.0,4.0
+52.0,4.0
+52.0,5.0
+54.0,5.0
+54.0,6.0
+55.0,6.0
+55.0,7.0
+56.0,7.0
+56.0,8.0
+57.0,8.0
+57.0,9.0
+59.0,9.0
+59.0,10.0
+61.0,10.0
+61.0,11.0
+62.0,11.0
+62.0,12.0
+63.0,12.0
+63.0,13.0
+64.0,13.0
+64.0,14.0
+85.0,14.0
+85.0,15.0
+86.0,15.0
+86.0,16.0
+87.0,16.0
+87.0,17.0
+114.0,17.0
+114.0,18.0
+115.0,18.0
+115.0,19.0
+117.0,19.0
+117.0,20.0
+118.0,20.0
+118.0,21.0
+120.0,21.0
+120.0,22.0
+122.0,22.0
+122.0,23.0
+126.0,23.0
+126.0,24.0
+147.0,24.0
+147.0,25.0
+149.0,25.0
+149.0,26.0
+150.0,26.0
+150.0,27.0
+151.0,27.0
+151.0,28.0
+2000.000002,28.0
+					</series>
+					<series title="" type="l" color="0xff1414" encoding="csv">0.0,0.0
+21.0,0.0
+21.0,1.0
+26.0,1.0
+26.0,2.0
+28.0,2.0
+28.0,3.0
+31.0,3.0
+31.0,4.0
+32.0,4.0
+32.0,5.0
+53.0,5.0
+53.0,6.0
+54.0,6.0
+54.0,7.0
+56.0,7.0
+56.0,8.0
+79.0,8.0
+79.0,9.0
+80.0,9.0
+80.0,10.0
+103.0,10.0
+103.0,11.0
+125.0,11.0
+125.0,12.0
+126.0,12.0
+126.0,13.0
+130.0,13.0
+130.0,14.0
+132.0,14.0
+132.0,15.0
+133.0,15.0
+133.0,16.0
+134.0,16.0
+134.0,17.0
+137.0,17.0
+137.0,18.0
+142.0,18.0
+142.0,19.0
+2000.000002,19.0
+					</series>
+					<series title="" type="l" color="0xff1515" encoding="csv">0.0,0.0
+23.0,0.0
+23.0,1.0
+27.0,1.0
+27.0,2.0
+29.0,2.0
+29.0,3.0
+35.0,3.0
+35.0,4.0
+36.0,4.0
+36.0,5.0
+38.0,5.0
+38.0,6.0
+40.0,6.0
+40.0,7.0
+62.0,7.0
+62.0,8.0
+67.0,8.0
+67.0,9.0
+70.0,9.0
+70.0,10.0
+93.0,10.0
+93.0,11.0
+94.0,11.0
+94.0,12.0
+96.0,12.0
+96.0,13.0
+98.0,13.0
+98.0,14.0
+100.0,14.0
+100.0,15.0
+102.0,15.0
+102.0,16.0
+105.0,16.0
+105.0,17.0
+107.0,17.0
+107.0,18.0
+108.0,18.0
+108.0,19.0
+112.0,19.0
+112.0,20.0
+133.0,20.0
+133.0,21.0
+156.9120430597104,21.0
+156.9120430597104,22.0
+2000.000002,22.0
+					</series>
+					<series title="" type="l" color="0xff1515" encoding="csv">0.0,0.0
+22.0,0.0
+22.0,1.0
+25.0,1.0
+25.0,2.0
+26.0,2.0
+26.0,3.0
+29.0,3.0
+29.0,4.0
+51.0,4.0
+51.0,5.0
+53.0,5.0
+53.0,6.0
+54.0,6.0
+54.0,7.0
+56.0,7.0
+56.0,8.0
+58.0,8.0
+58.0,9.0
+59.0,9.0
+59.0,10.0
+60.0,10.0
+60.0,11.0
+81.0,11.0
+81.0,12.0
+82.0,12.0
+82.0,13.0
+83.0,13.0
+83.0,14.0
+84.0,14.0
+84.0,15.0
+88.0,15.0
+88.0,16.0
+89.0,16.0
+89.0,17.0
+90.0,17.0
+90.0,18.0
+92.0,18.0
+92.0,19.0
+93.0,19.0
+93.0,20.0
+115.0,20.0
+115.0,21.0
+116.0,21.0
+116.0,22.0
+118.0,22.0
+118.0,23.0
+119.0,23.0
+119.0,24.0
+140.0,24.0
+140.0,25.0
+2000.000002,25.0
+					</series>
+					<series title="" type="l" color="0xff1616" encoding="csv">0.0,0.0
+21.0,0.0
+21.0,1.0
+22.0,1.0
+22.0,2.0
+26.0,2.0
+26.0,3.0
+28.0,3.0
+28.0,4.0
+29.0,4.0
+29.0,5.0
+31.0,5.0
+31.0,6.0
+32.0,6.0
+32.0,7.0
+56.0,7.0
+56.0,8.0
+58.0,8.0
+58.0,9.0
+59.0,9.0
+59.0,10.0
+84.0,10.0
+84.0,11.0
+86.0,11.0
+86.0,12.0
+87.0,12.0
+87.0,13.0
+89.0,13.0
+89.0,14.0
+90.0,14.0
+90.0,15.0
+113.0,15.0
+113.0,16.0
+117.0,16.0
+117.0,17.0
+119.0,17.0
+119.0,18.0
+121.0,18.0
+121.0,19.0
+124.0,19.0
+124.0,20.0
+145.0,20.0
+145.0,21.0
+147.0,21.0
+147.0,22.0
+153.0,22.0
+153.0,23.0
+2000.000002,23.0
+					</series>
+					<series title="" type="l" color="0xff1717" encoding="csv">0.0,0.0
+21.0,0.0
+21.0,1.0
+22.0,1.0
+22.0,2.0
+23.0,2.0
+23.0,3.0
+44.0,3.0
+44.0,4.0
+67.0,4.0
+67.0,5.0
+69.0,5.0
+69.0,6.0
+70.0,6.0
+70.0,7.0
+71.0,7.0
+71.0,8.0
+72.0,8.0
+72.0,9.0
+74.0,9.0
+74.0,10.0
+75.0,10.0
+75.0,11.0
+76.0,11.0
+76.0,12.0
+97.0,12.0
+97.0,13.0
+98.0,13.0
+98.0,14.0
+100.0,14.0
+100.0,15.0
+101.0,15.0
+101.0,16.0
+102.0,16.0
+102.0,17.0
+130.0,17.0
+130.0,18.0
+133.0,18.0
+133.0,19.0
+2000.000002,19.0
+					</series>
+					<series title="" type="l" color="0xff1818" encoding="csv">0.0,0.0
+23.0,0.0
+23.0,1.0
+27.0,1.0
+27.0,2.0
+28.0,2.0
+28.0,3.0
+31.0,3.0
+31.0,4.0
+53.0,4.0
+53.0,5.0
+57.0,5.0
+57.0,6.0
+59.0,6.0
+59.0,7.0
+82.0,7.0
+82.0,8.0
+83.0,8.0
+83.0,9.0
+84.0,9.0
+84.0,10.0
+105.0,10.0
+105.0,11.0
+126.0,11.0
+126.0,12.0
+128.0,12.0
+128.0,13.0
+130.0,13.0
+130.0,14.0
+2000.000002,14.0
+					</series>
+					<series title="" type="l" color="0xff1919" encoding="csv">0.0,0.0
+21.0,0.0
+21.0,1.0
+22.0,1.0
+22.0,2.0
+25.0,2.0
+25.0,3.0
+26.0,3.0
+26.0,4.0
+27.0,4.0
+27.0,5.0
+48.0,5.0
+48.0,6.0
+73.0,6.0
+73.0,7.0
+97.0,7.0
+97.0,8.0
+98.0,8.0
+98.0,9.0
+99.0,9.0
+99.0,10.0
+121.0,10.0
+121.0,11.0
+123.0,11.0
+123.0,12.0
+124.0,12.0
+124.0,13.0
+125.0,13.0
+125.0,14.0
+127.0,14.0
+127.0,15.0
+129.0,15.0
+129.0,16.0
+2000.000002,16.0
+					</series>
+					<series title="" type="l" color="0xff1a1a" encoding="csv">0.0,0.0
+22.0,0.0
+22.0,1.0
+23.0,1.0
+23.0,2.0
+25.0,2.0
+25.0,3.0
+48.0,3.0
+48.0,4.0
+49.0,4.0
+49.0,5.0
+52.0,5.0
+52.0,6.0
+53.0,6.0
+53.0,7.0
+54.0,7.0
+54.0,8.0
+57.0,8.0
+57.0,9.0
+58.0,9.0
+58.0,10.0
+59.0,10.0
+59.0,11.0
+80.0,11.0
+80.0,12.0
+82.0,12.0
+82.0,13.0
+83.0,13.0
+83.0,14.0
+105.0,14.0
+105.0,15.0
+127.0,15.0
+127.0,16.0
+129.0,16.0
+129.0,17.0
+130.0,17.0
+130.0,18.0
+132.0,18.0
+132.0,19.0
+133.0,19.0
+133.0,20.0
+2000.000002,20.0
+					</series>
+					<series title="" type="l" color="0xff1b1b" encoding="csv">0.0,0.0
+23.0,0.0
+23.0,1.0
+24.0,1.0
+24.0,2.0
+25.0,2.0
+25.0,3.0
+47.0,3.0
+47.0,4.0
+69.0,4.0
+69.0,5.0
+70.0,5.0
+70.0,6.0
+93.0,6.0
+93.0,7.0
+96.0,7.0
+96.0,8.0
+97.0,8.0
+97.0,9.0
+99.0,9.0
+99.0,10.0
+121.0,10.0
+121.0,11.0
+123.0,11.0
+123.0,12.0
+126.0,12.0
+126.0,13.0
+128.0,13.0
+128.0,14.0
+129.0,14.0
+129.0,15.0
+2000.000002,15.0
+					</series>
+					<series title="" type="l" color="0xff1c1c" encoding="csv">0.0,0.0
+21.0,0.0
+21.0,1.0
+23.0,1.0
+23.0,2.0
+26.0,2.0
+26.0,3.0
+29.0,3.0
+29.0,4.0
+52.0,4.0
+52.0,5.0
+53.0,5.0
+53.0,6.0
+54.0,6.0
+54.0,7.0
+55.0,7.0
+55.0,8.0
+56.0,8.0
+56.0,9.0
+59.0,9.0
+59.0,10.0
+81.0,10.0
+81.0,11.0
+84.0,11.0
+84.0,12.0
+86.0,12.0
+86.0,13.0
+87.0,13.0
+87.0,14.0
+88.0,14.0
+88.0,15.0
+89.0,15.0
+89.0,16.0
+90.0,16.0
+90.0,17.0
+91.0,17.0
+91.0,18.0
+112.0,18.0
+112.0,19.0
+113.0,19.0
+113.0,20.0
+114.0,20.0
+114.0,21.0
+115.0,21.0
+115.0,22.0
+117.0,22.0
+117.0,23.0
+118.0,23.0
+118.0,24.0
+119.0,24.0
+119.0,25.0
+120.0,25.0
+120.0,26.0
+146.0,26.0
+146.0,27.0
+149.0,27.0
+149.0,28.0
+150.0,28.0
+150.0,29.0
+2000.000002,29.0
+					</series>
+					<series title="" type="l" color="0xff1d1d" encoding="csv">0.0,0.0
+25.0,0.0
+25.0,1.0
+26.0,1.0
+26.0,2.0
+27.0,2.0
+27.0,3.0
+28.0,3.0
+28.0,4.0
+29.0,4.0
+29.0,5.0
+52.0,5.0
+52.0,6.0
+53.0,6.0
+53.0,7.0
+54.0,7.0
+54.0,8.0
+55.0,8.0
+55.0,9.0
+56.0,9.0
+56.0,10.0
+57.0,10.0
+57.0,11.0
+61.0,11.0
+61.0,12.0
+83.0,12.0
+83.0,13.0
+84.0,13.0
+84.0,14.0
+87.0,14.0
+87.0,15.0
+90.0,15.0
+90.0,16.0
+91.0,16.0
+91.0,17.0
+93.0,17.0
+93.0,18.0
+97.0,18.0
+97.0,19.0
+101.0,19.0
+101.0,20.0
+123.0,20.0
+123.0,21.0
+124.0,21.0
+124.0,22.0
+125.0,22.0
+125.0,23.0
+127.0,23.0
+127.0,24.0
+128.0,24.0
+128.0,25.0
+134.0,25.0
+134.0,26.0
+137.0,26.0
+137.0,27.0
+139.0,27.0
+139.0,28.0
+140.0,28.0
+140.0,29.0
+162.0,29.0
+162.0,30.0
+163.0,30.0
+163.0,31.0
+166.0,31.0
+166.0,32.0
+168.0,32.0
+168.0,33.0
+169.0,33.0
+169.0,34.0
+172.0,34.0
+172.0,35.0
+174.0,35.0
+174.0,36.0
+2000.000002,36.0
+					</series>
+					<series title="" type="l" color="0xff1d1d" encoding="csv">0.0,0.0
+22.0,0.0
+22.0,1.0
+24.0,1.0
+24.0,2.0
+26.0,2.0
+26.0,3.0
+27.0,3.0
+27.0,4.0
+28.0,4.0
+28.0,5.0
+32.0,5.0
+32.0,6.0
+33.0,6.0
+33.0,7.0
+35.0,7.0
+35.0,8.0
+37.0,8.0
+37.0,9.0
+38.0,9.0
+38.0,10.0
+59.0,10.0
+59.0,11.0
+60.0,11.0
+60.0,12.0
+63.0,12.0
+63.0,13.0
+65.0,13.0
+65.0,14.0
+66.0,14.0
+66.0,15.0
+89.28801236712508,15.0
+89.28801236712508,16.0
+91.28801236712508,16.0
+91.28801236712508,17.0
+93.28801236712508,17.0
+93.28801236712508,18.0
+95.28801236712508,18.0
+95.28801236712508,19.0
+116.28801236712508,19.0
+116.28801236712508,20.0
+119.28801236712508,20.0
+119.28801236712508,21.0
+120.28801236712508,21.0
+120.28801236712508,22.0
+121.28801236712508,22.0
+121.28801236712508,23.0
+122.28801236712508,23.0
+122.28801236712508,24.0
+147.28801236712508,24.0
+147.28801236712508,25.0
+150.28801236712508,25.0
+150.28801236712508,26.0
+151.28801236712508,26.0
+151.28801236712508,27.0
+152.28801236712508,27.0
+152.28801236712508,28.0
+153.28801236712508,28.0
+153.28801236712508,29.0
+2000.000002,29.0
+					</series>
+					<series title="" type="l" color="0xff1e1e" encoding="csv">0.0,0.0
+23.0,0.0
+23.0,1.0
+44.0,1.0
+44.0,2.0
+66.0,2.0
+66.0,3.0
+69.0,3.0
+69.0,4.0
+70.0,4.0
+70.0,5.0
+93.0,5.0
+93.0,6.0
+94.0,6.0
+94.0,7.0
+115.0,7.0
+115.0,8.0
+116.0,8.0
+116.0,9.0
+117.0,9.0
+117.0,10.0
+118.0,10.0
+118.0,11.0
+119.0,11.0
+119.0,12.0
+2000.000002,12.0
+					</series>
+					<series title="" type="l" color="0xff1f1f" encoding="csv">0.0,0.0
+21.0,0.0
+21.0,1.0
+45.0,1.0
+45.0,2.0
+66.0,2.0
+66.0,3.0
+69.0,3.0
+69.0,4.0
+91.0,4.0
+91.0,5.0
+95.0,5.0
+95.0,6.0
+96.0,6.0
+96.0,7.0
+118.0,7.0
+118.0,8.0
+122.0,8.0
+122.0,9.0
+125.0,9.0
+125.0,10.0
+132.0,10.0
+132.0,11.0
+133.0,11.0
+133.0,12.0
+136.0,12.0
+136.0,13.0
+137.0,13.0
+137.0,14.0
+138.0,14.0
+138.0,15.0
+2000.000002,15.0
+					</series>
+					<series title="" type="l" color="0xff2020" encoding="csv">0.0,0.0
+21.0,0.0
+21.0,1.0
+23.0,1.0
+23.0,2.0
+24.0,2.0
+24.0,3.0
+26.0,3.0
+26.0,4.0
+27.0,4.0
+27.0,5.0
+29.0,5.0
+29.0,6.0
+30.0,6.0
+30.0,7.0
+32.0,7.0
+32.0,8.0
+53.0,8.0
+53.0,9.0
+54.0,9.0
+54.0,10.0
+57.0,10.0
+57.0,11.0
+58.0,11.0
+58.0,12.0
+60.0,12.0
+60.0,13.0
+61.0,13.0
+61.0,14.0
+63.0,14.0
+63.0,15.0
+68.0,15.0
+68.0,16.0
+70.0,16.0
+70.0,17.0
+94.0,17.0
+94.0,18.0
+97.0,18.0
+97.0,19.0
+98.0,19.0
+98.0,20.0
+120.0,20.0
+120.0,21.0
+122.0,21.0
+122.0,22.0
+124.0,22.0
+124.0,23.0
+125.0,23.0
+125.0,24.0
+128.0,24.0
+128.0,25.0
+152.0,25.0
+152.0,26.0
+154.0,26.0
+154.0,27.0
+156.0,27.0
+156.0,28.0
+2000.000002,28.0
+					</series>
+					<series title="" type="l" color="0xff2121" encoding="csv">0.0,0.0
+21.0,0.0
+21.0,1.0
+22.0,1.0
+22.0,2.0
+25.0,2.0
+25.0,3.0
+46.0,3.0
+46.0,4.0
+67.0,4.0
+67.0,5.0
+71.0,5.0
+71.0,6.0
+97.0,6.0
+97.0,7.0
+101.0,7.0
+101.0,8.0
+104.0,8.0
+104.0,9.0
+105.0,9.0
+105.0,10.0
+106.0,10.0
+106.0,11.0
+107.0,11.0
+107.0,12.0
+128.0,12.0
+128.0,13.0
+129.0,13.0
+129.0,14.0
+131.0,14.0
+131.0,15.0
+132.0,15.0
+132.0,16.0
+134.0,16.0
+134.0,17.0
+138.0,17.0
+138.0,18.0
+140.0,18.0
+140.0,19.0
+143.0,19.0
+143.0,20.0
+146.0,20.0
+146.0,21.0
+147.0,21.0
+147.0,22.0
+148.0,22.0
+148.0,23.0
+149.0,23.0
+149.0,24.0
+2000.000002,24.0
+					</series>
+					<series title="" type="l" color="0xff2222" encoding="csv">0.0,0.0
+22.0,0.0
+22.0,1.0
+25.0,1.0
+25.0,2.0
+27.0,2.0
+27.0,3.0
+29.0,3.0
+29.0,4.0
+31.0,4.0
+31.0,5.0
+55.0,5.0
+55.0,6.0
+61.0,6.0
+61.0,7.0
+62.0,7.0
+62.0,8.0
+66.0,8.0
+66.0,9.0
+87.0,9.0
+87.0,10.0
+88.0,10.0
+88.0,11.0
+90.0,11.0
+90.0,12.0
+92.0,12.0
+92.0,13.0
+93.0,13.0
+93.0,14.0
+115.0,14.0
+115.0,15.0
+120.0,15.0
+120.0,16.0
+123.0,16.0
+123.0,17.0
+126.0,17.0
+126.0,18.0
+131.0,18.0
+131.0,19.0
+132.0,19.0
+132.0,20.0
+133.0,20.0
+133.0,21.0
+134.0,21.0
+134.0,22.0
+139.0,22.0
+139.0,23.0
+141.0,23.0
+141.0,24.0
+142.0,24.0
+142.0,25.0
+144.0,25.0
+144.0,26.0
+145.0,26.0
+145.0,27.0
+166.0,27.0
+166.0,28.0
+2000.000002,28.0
+					</series>
+					<series title="" type="l" color="0xff2323" encoding="csv">0.0,0.0
+21.0,0.0
+21.0,1.0
+22.0,1.0
+22.0,2.0
+23.0,2.0
+23.0,3.0
+45.0,3.0
+45.0,4.0
+58.0,4.0
+58.0,5.0
+61.0,5.0
+61.0,6.0
+62.0,6.0
+62.0,7.0
+85.0,7.0
+85.0,8.0
+86.0,8.0
+86.0,9.0
+87.0,9.0
+87.0,10.0
+115.0,10.0
+115.0,11.0
+138.0,11.0
+138.0,12.0
+139.0,12.0
+139.0,13.0
+141.0,13.0
+141.0,14.0
+142.0,14.0
+142.0,15.0
+144.0,15.0
+144.0,16.0
+146.0,16.0
+146.0,17.0
+148.0,17.0
+148.0,18.0
+149.0,18.0
+149.0,19.0
+150.0,19.0
+150.0,20.0
+2000.000002,20.0
+					</series>
+					<series title="" type="l" color="0xff2424" encoding="csv">0.0,0.0
+21.0,0.0
+21.0,1.0
+22.0,1.0
+22.0,2.0
+23.0,2.0
+23.0,3.0
+45.0,3.0
+45.0,4.0
+46.0,4.0
+46.0,5.0
+49.0,5.0
+49.0,6.0
+70.0,6.0
+70.0,7.0
+71.0,7.0
+71.0,8.0
+93.0,8.0
+93.0,9.0
+96.0,9.0
+96.0,10.0
+97.0,10.0
+97.0,11.0
+121.0,11.0
+121.0,12.0
+124.0,12.0
+124.0,13.0
+129.0,13.0
+129.0,14.0
+130.0,14.0
+130.0,15.0
+132.0,15.0
+132.0,16.0
+133.0,16.0
+133.0,17.0
+134.0,17.0
+134.0,18.0
+135.0,18.0
+135.0,19.0
+2000.000002,19.0
+					</series>
+					<series title="" type="l" color="0xff2525" encoding="csv">0.0,0.0
+22.0,0.0
+22.0,1.0
+23.0,1.0
+23.0,2.0
+25.0,2.0
+25.0,3.0
+26.0,3.0
+26.0,4.0
+27.0,4.0
+27.0,5.0
+50.0,5.0
+50.0,6.0
+54.0,6.0
+54.0,7.0
+55.0,7.0
+55.0,8.0
+77.0,8.0
+77.0,9.0
+78.0,9.0
+78.0,10.0
+79.0,10.0
+79.0,11.0
+80.0,11.0
+80.0,12.0
+101.0,12.0
+101.0,13.0
+103.0,13.0
+103.0,14.0
+104.0,14.0
+104.0,15.0
+127.0,15.0
+127.0,16.0
+2000.000002,16.0
+					</series>
+					<series title="" type="l" color="0xff2525" encoding="csv">0.0,0.0
+21.0,0.0
+21.0,1.0
+22.0,1.0
+22.0,2.0
+23.0,2.0
+23.0,3.0
+45.0,3.0
+45.0,4.0
+47.0,4.0
+47.0,5.0
+49.0,5.0
+49.0,6.0
+50.0,6.0
+50.0,7.0
+51.0,7.0
+51.0,8.0
+52.0,8.0
+52.0,9.0
+53.0,9.0
+53.0,10.0
+76.0,10.0
+76.0,11.0
+99.0,11.0
+99.0,12.0
+121.0,12.0
+121.0,13.0
+124.0,13.0
+124.0,14.0
+126.0,14.0
+126.0,15.0
+129.0,15.0
+129.0,16.0
+2000.000002,16.0
+					</series>
+					<series title="" type="l" color="0xff2626" encoding="csv">0.0,0.0
+24.0,0.0
+24.0,1.0
+25.0,1.0
+25.0,2.0
+26.0,2.0
+26.0,3.0
+48.0,3.0
+48.0,4.0
+73.1661775347311,4.0
+73.1661775347311,5.0
+74.1661775347311,5.0
+74.1661775347311,6.0
+80.1661775347311,6.0
+80.1661775347311,7.0
+82.1661775347311,7.0
+82.1661775347311,8.0
+83.1661775347311,8.0
+83.1661775347311,9.0
+84.1661775347311,9.0
+84.1661775347311,10.0
+85.1661775347311,10.0
+85.1661775347311,11.0
+107.08388283827192,11.0
+107.08388283827192,12.0
+130.0838828382719,12.0
+130.0838828382719,13.0
+2000.000002,13.0
+					</series>
+					<series title="" type="l" color="0xff2727" encoding="csv">0.0,0.0
+23.0,0.0
+23.0,1.0
+44.0,1.0
+44.0,2.0
+68.0,2.0
+68.0,3.0
+69.0,3.0
+69.0,4.0
+94.0,4.0
+94.0,5.0
+95.0,5.0
+95.0,6.0
+97.0,6.0
+97.0,7.0
+122.0,7.0
+122.0,8.0
+123.0,8.0
+123.0,9.0
+125.0,9.0
+125.0,10.0
+127.0,10.0
+127.0,11.0
+131.0,11.0
+131.0,12.0
+132.0,12.0
+132.0,13.0
+135.0,13.0
+135.0,14.0
+2000.000002,14.0
+					</series>
+					<series title="" type="l" color="0xff2828" encoding="csv">0.0,0.0
+21.0,0.0
+21.0,1.0
+23.0,1.0
+23.0,2.0
+24.0,2.0
+24.0,3.0
+26.0,3.0
+26.0,4.0
+27.0,4.0
+27.0,5.0
+30.0,5.0
+30.0,6.0
+32.0,6.0
+32.0,7.0
+56.0,7.0
+56.0,8.0
+58.0,8.0
+58.0,9.0
+79.0,9.0
+79.0,10.0
+80.0,10.0
+80.0,11.0
+102.0,11.0
+102.0,12.0
+129.0,12.0
+129.0,13.0
+2000.000002,13.0
+					</series>
+					<series title="" type="l" color="0xff2929" encoding="csv">0.0,0.0
+22.0,0.0
+22.0,1.0
+23.0,1.0
+23.0,2.0
+27.0,2.0
+27.0,3.0
+29.0,3.0
+29.0,4.0
+31.0,4.0
+31.0,5.0
+53.0,5.0
+53.0,6.0
+56.0,6.0
+56.0,7.0
+59.0,7.0
+59.0,8.0
+63.0,8.0
+63.0,9.0
+64.0,9.0
+64.0,10.0
+65.0,10.0
+65.0,11.0
+69.0,11.0
+69.0,12.0
+70.0,12.0
+70.0,13.0
+91.0,13.0
+91.0,14.0
+95.0,14.0
+95.0,15.0
+98.0,15.0
+98.0,16.0
+124.0,16.0
+124.0,17.0
+125.0,17.0
+125.0,18.0
+126.0,18.0
+126.0,19.0
+127.0,19.0
+127.0,20.0
+128.0,20.0
+128.0,21.0
+129.0,21.0
+129.0,22.0
+132.0,22.0
+132.0,23.0
+158.0,23.0
+158.0,24.0
+159.0,24.0
+159.0,25.0
+160.0,25.0
+160.0,26.0
+161.0,26.0
+161.0,27.0
+163.0,27.0
+163.0,28.0
+2000.000002,28.0
+					</series>
+					<series title="" type="l" color="0xff2a2a" encoding="csv">0.0,0.0
+23.0,0.0
+23.0,1.0
+24.0,1.0
+24.0,2.0
+26.0,2.0
+26.0,3.0
+27.0,3.0
+27.0,4.0
+50.0,4.0
+50.0,5.0
+51.0,5.0
+51.0,6.0
+54.0,6.0
+54.0,7.0
+57.0,7.0
+57.0,8.0
+59.0,8.0
+59.0,9.0
+60.0,9.0
+60.0,10.0
+61.0,10.0
+61.0,11.0
+62.0,11.0
+62.0,12.0
+83.0,12.0
+83.0,13.0
+85.0,13.0
+85.0,14.0
+86.0,14.0
+86.0,15.0
+87.0,15.0
+87.0,16.0
+112.0,16.0
+112.0,17.0
+113.0,17.0
+113.0,18.0
+114.0,18.0
+114.0,19.0
+115.0,19.0
+115.0,20.0
+116.0,20.0
+116.0,21.0
+118.0,21.0
+118.0,22.0
+120.0,22.0
+120.0,23.0
+121.0,23.0
+121.0,24.0
+142.0,24.0
+142.0,25.0
+145.0,25.0
+145.0,26.0
+146.0,26.0
+146.0,27.0
+147.0,27.0
+147.0,28.0
+149.0,28.0
+149.0,29.0
+151.0,29.0
+151.0,30.0
+153.0,30.0
+153.0,31.0
+157.0,31.0
+157.0,32.0
+159.0,32.0
+159.0,33.0
+161.0,33.0
+161.0,34.0
+2000.000002,34.0
+					</series>
+					<series title="" type="l" color="0xff2b2b" encoding="csv">0.0,0.0
+21.0,0.0
+21.0,1.0
+25.0,1.0
+25.0,2.0
+26.0,2.0
+26.0,3.0
+29.0,3.0
+29.0,4.0
+32.0,4.0
+32.0,5.0
+54.0,5.0
+54.0,6.0
+55.0,6.0
+55.0,7.0
+57.0,7.0
+57.0,8.0
+60.0,8.0
+60.0,9.0
+63.0,9.0
+63.0,10.0
+69.0,10.0
+69.0,11.0
+93.0,11.0
+93.0,12.0
+94.0,12.0
+94.0,13.0
+96.0,13.0
+96.0,14.0
+99.0,14.0
+99.0,15.0
+121.0,15.0
+121.0,16.0
+125.0,16.0
+125.0,17.0
+126.0,17.0
+126.0,18.0
+128.0,18.0
+128.0,19.0
+129.0,19.0
+129.0,20.0
+130.0,20.0
+130.0,21.0
+131.0,21.0
+131.0,22.0
+152.0,22.0
+152.0,23.0
+153.0,23.0
+153.0,24.0
+155.0,24.0
+155.0,25.0
+156.0,25.0
+156.0,26.0
+159.0,26.0
+159.0,27.0
+165.0,27.0
+165.0,28.0
+167.0,28.0
+167.0,29.0
+2000.000002,29.0
+					</series>
+					<series title="" type="l" color="0xff2c2c" encoding="csv">0.0,0.0
+21.0,0.0
+21.0,1.0
+22.0,1.0
+22.0,2.0
+25.0,2.0
+25.0,3.0
+50.0,3.0
+50.0,4.0
+73.0,4.0
+73.0,5.0
+74.0,5.0
+74.0,6.0
+75.0,6.0
+75.0,7.0
+97.0,7.0
+97.0,8.0
+98.0,8.0
+98.0,9.0
+99.0,9.0
+99.0,10.0
+120.0,10.0
+120.0,11.0
+121.0,11.0
+121.0,12.0
+122.0,12.0
+122.0,13.0
+2000.000002,13.0
+					</series>
+					<series title="" type="l" color="0xff2d2d" encoding="csv">0.0,0.0
+24.0,0.0
+24.0,1.0
+28.0,1.0
+28.0,2.0
+29.0,2.0
+29.0,3.0
+31.0,3.0
+31.0,4.0
+32.0,4.0
+32.0,5.0
+54.0,5.0
+54.0,6.0
+56.0,6.0
+56.0,7.0
+58.0,7.0
+58.0,8.0
+68.0,8.0
+68.0,9.0
+69.0,9.0
+69.0,10.0
+72.0,10.0
+72.0,11.0
+73.0,11.0
+73.0,12.0
+97.0,12.0
+97.0,13.0
+99.0,13.0
+99.0,14.0
+100.0,14.0
+100.0,15.0
+101.0,15.0
+101.0,16.0
+103.0,16.0
+103.0,17.0
+104.0,17.0
+104.0,18.0
+125.0,18.0
+125.0,19.0
+126.0,19.0
+126.0,20.0
+127.0,20.0
+127.0,21.0
+129.0,21.0
+129.0,22.0
+132.0,22.0
+132.0,23.0
+137.0,23.0
+137.0,24.0
+138.0,24.0
+138.0,25.0
+141.0,25.0
+141.0,26.0
+162.0,26.0
+162.0,27.0
+164.0,27.0
+164.0,28.0
+165.0,28.0
+165.0,29.0
+166.0,29.0
+166.0,30.0
+167.0,30.0
+167.0,31.0
+169.0,31.0
+169.0,32.0
+170.0,32.0
+170.0,33.0
+171.0,33.0
+171.0,34.0
+2000.000002,34.0
+					</series>
+					<series title="" type="l" color="0xff2e2e" encoding="csv">0.0,0.0
+21.0,0.0
+21.0,1.0
+22.0,1.0
+22.0,2.0
+24.0,2.0
+24.0,3.0
+25.0,3.0
+25.0,4.0
+27.0,4.0
+27.0,5.0
+29.0,5.0
+29.0,6.0
+31.0,6.0
+31.0,7.0
+32.0,7.0
+32.0,8.0
+34.0,8.0
+34.0,9.0
+35.0,9.0
+35.0,10.0
+38.0,10.0
+38.0,11.0
+59.0,11.0
+59.0,12.0
+61.0,12.0
+61.0,13.0
+62.0,13.0
+62.0,14.0
+63.0,14.0
+63.0,15.0
+86.3173251899425,15.0
+86.3173251899425,16.0
+87.3173251899425,16.0
+87.3173251899425,17.0
+109.3173251899425,17.0
+109.3173251899425,18.0
+131.3173251899425,18.0
+131.3173251899425,19.0
+134.3173251899425,19.0
+134.3173251899425,20.0
+135.3173251899425,20.0
+135.3173251899425,21.0
+136.3173251899425,21.0
+136.3173251899425,22.0
+137.3173251899425,22.0
+137.3173251899425,23.0
+138.3173251899425,23.0
+138.3173251899425,24.0
+139.3173251899425,24.0
+139.3173251899425,25.0
+2000.000002,25.0
+					</series>
+					<series title="" type="l" color="0xff2e2e" encoding="csv">0.0,0.0
+23.0,0.0
+23.0,1.0
+44.0,1.0
+44.0,2.0
+48.0,2.0
+48.0,3.0
+73.93367916042916,3.0
+73.93367916042916,4.0
+74.93367916042916,4.0
+74.93367916042916,5.0
+97.93367916042916,5.0
+97.93367916042916,6.0
+99.93367916042916,6.0
+99.93367916042916,7.0
+103.93367916042916,7.0
+103.93367916042916,8.0
+124.93367916042916,8.0
+124.93367916042916,9.0
+125.93367916042916,9.0
+125.93367916042916,10.0
+126.93367916042916,10.0
+126.93367916042916,11.0
+127.93367916042916,11.0
+127.93367916042916,12.0
+2000.000002,12.0
+					</series>
+					<series title="" type="l" color="0xff2f2f" encoding="csv">0.0,0.0
+23.0,0.0
+23.0,1.0
+24.0,1.0
+24.0,2.0
+26.0,2.0
+26.0,3.0
+28.0,3.0
+28.0,4.0
+30.0,4.0
+30.0,5.0
+53.0,5.0
+53.0,6.0
+56.0,6.0
+56.0,7.0
+58.0,7.0
+58.0,8.0
+65.0,8.0
+65.0,9.0
+88.0,9.0
+88.0,10.0
+90.0,10.0
+90.0,11.0
+91.0,11.0
+91.0,12.0
+92.0,12.0
+92.0,13.0
+94.0,13.0
+94.0,14.0
+95.0,14.0
+95.0,15.0
+96.0,15.0
+96.0,16.0
+120.0,16.0
+120.0,17.0
+121.0,17.0
+121.0,18.0
+122.0,18.0
+122.0,19.0
+144.0,19.0
+144.0,20.0
+145.0,20.0
+145.0,21.0
+146.0,21.0
+146.0,22.0
+2000.000002,22.0
+					</series>
+					<series title="" type="l" color="0xff3030" encoding="csv">0.0,0.0
+21.0,0.0
+21.0,1.0
+23.0,1.0
+23.0,2.0
+24.0,2.0
+24.0,3.0
+47.0,3.0
+47.0,4.0
+48.0,4.0
+48.0,5.0
+49.0,5.0
+49.0,6.0
+71.0,6.0
+71.0,7.0
+72.0,7.0
+72.0,8.0
+93.0,8.0
+93.0,9.0
+94.0,9.0
+94.0,10.0
+95.0,10.0
+95.0,11.0
+116.99201365746558,11.0
+116.99201365746558,12.0
+121.99201365746558,12.0
+121.99201365746558,13.0
+122.99201365746558,13.0
+122.99201365746558,14.0
+130.99201365746558,14.0
+130.99201365746558,15.0
+131.99201365746558,15.0
+131.99201365746558,16.0
+132.99201365746558,16.0
+132.99201365746558,17.0
+2000.000002,17.0
+					</series>
+					<series title="" type="l" color="0xff3131" encoding="csv">0.0,0.0
+22.0,0.0
+22.0,1.0
+23.0,1.0
+23.0,2.0
+24.0,2.0
+24.0,3.0
+48.0,3.0
+48.0,4.0
+49.0,4.0
+49.0,5.0
+50.0,5.0
+50.0,6.0
+51.0,6.0
+51.0,7.0
+52.0,7.0
+52.0,8.0
+54.0,8.0
+54.0,9.0
+55.0,9.0
+55.0,10.0
+79.0,10.0
+79.0,11.0
+81.0,11.0
+81.0,12.0
+83.0,12.0
+83.0,13.0
+105.0,13.0
+105.0,14.0
+126.0,14.0
+126.0,15.0
+128.0,15.0
+128.0,16.0
+129.0,16.0
+129.0,17.0
+2000.000002,17.0
+					</series>
+					<series title="" type="l" color="0xff3232" encoding="csv">0.0,0.0
+23.0,0.0
+23.0,1.0
+25.0,1.0
+25.0,2.0
+48.0,2.0
+48.0,3.0
+70.0,3.0
+70.0,4.0
+71.0,4.0
+71.0,5.0
+72.0,5.0
+72.0,6.0
+74.0,6.0
+74.0,7.0
+75.0,7.0
+75.0,8.0
+99.86952450045219,8.0
+99.86952450045219,9.0
+101.86952450045219,9.0
+101.86952450045219,10.0
+103.86952450045219,10.0
+103.86952450045219,11.0
+105.86952450045219,11.0
+105.86952450045219,12.0
+108.86952450045219,12.0
+108.86952450045219,13.0
+109.86952450045219,13.0
+109.86952450045219,14.0
+114.86952450045219,14.0
+114.86952450045219,15.0
+115.86952450045219,15.0
+115.86952450045219,16.0
+116.86952450045219,16.0
+116.86952450045219,17.0
+117.86952450045219,17.0
+117.86952450045219,18.0
+138.8695245004522,18.0
+138.8695245004522,19.0
+139.8695245004522,19.0
+139.8695245004522,20.0
+140.8695245004522,20.0
+140.8695245004522,21.0
+2000.000002,21.0
+					</series>
+					<series title="" type="l" color="0xff3333" encoding="csv">0.0,0.0
+23.0,0.0
+23.0,1.0
+24.0,1.0
+24.0,2.0
+26.0,2.0
+26.0,3.0
+28.0,3.0
+28.0,4.0
+51.0,4.0
+51.0,5.0
+74.0,5.0
+74.0,6.0
+75.0,6.0
+75.0,7.0
+76.0,7.0
+76.0,8.0
+77.0,8.0
+77.0,9.0
+78.0,9.0
+78.0,10.0
+80.0,10.0
+80.0,11.0
+81.0,11.0
+81.0,12.0
+87.0,12.0
+87.0,13.0
+88.0,13.0
+88.0,14.0
+91.0,14.0
+91.0,15.0
+116.0,15.0
+116.0,16.0
+117.0,16.0
+117.0,17.0
+118.0,17.0
+118.0,18.0
+139.0,18.0
+139.0,19.0
+142.0,19.0
+142.0,20.0
+143.0,20.0
+143.0,21.0
+145.0,21.0
+145.0,22.0
+2000.000002,22.0
+					</series>
+					<series title="" type="l" color="0xff3434" encoding="csv">0.0,0.0
+25.0,0.0
+25.0,1.0
+27.0,1.0
+27.0,2.0
+31.0,2.0
+31.0,3.0
+59.0,3.0
+59.0,4.0
+60.0,4.0
+60.0,5.0
+61.0,5.0
+61.0,6.0
+87.0,6.0
+87.0,7.0
+88.0,7.0
+88.0,8.0
+110.0,8.0
+110.0,9.0
+132.0,9.0
+132.0,10.0
+134.0,10.0
+134.0,11.0
+137.0,11.0
+137.0,12.0
+2000.000002,12.0
+					</series>
+					<series title="" type="l" color="0xff3535" encoding="csv">0.0,0.0
+23.0,0.0
+23.0,1.0
+25.0,1.0
+25.0,2.0
+26.0,2.0
+26.0,3.0
+27.0,3.0
+27.0,4.0
+50.0,4.0
+50.0,5.0
+71.0,5.0
+71.0,6.0
+93.0,6.0
+93.0,7.0
+94.0,7.0
+94.0,8.0
+95.0,8.0
+95.0,9.0
+118.0,9.0
+118.0,10.0
+119.0,10.0
+119.0,11.0
+121.0,11.0
+121.0,12.0
+125.0,12.0
+125.0,13.0
+2000.000002,13.0
+					</series>
+					<series title="" type="l" color="0xff3636" encoding="csv">0.0,0.0
+25.0,0.0
+25.0,1.0
+27.0,1.0
+27.0,2.0
+28.0,2.0
+28.0,3.0
+49.0,3.0
+49.0,4.0
+52.0,4.0
+52.0,5.0
+53.0,5.0
+53.0,6.0
+58.0,6.0
+58.0,7.0
+59.0,7.0
+59.0,8.0
+60.0,8.0
+60.0,9.0
+62.0,9.0
+62.0,10.0
+64.0,10.0
+64.0,11.0
+65.0,11.0
+65.0,12.0
+90.0,12.0
+90.0,13.0
+93.0,13.0
+93.0,14.0
+94.0,14.0
+94.0,15.0
+117.0,15.0
+117.0,16.0
+120.0,16.0
+120.0,17.0
+121.0,17.0
+121.0,18.0
+122.0,18.0
+122.0,19.0
+123.0,19.0
+123.0,20.0
+124.0,20.0
+124.0,21.0
+129.0,21.0
+129.0,22.0
+131.0,22.0
+131.0,23.0
+154.0,23.0
+154.0,24.0
+156.0,24.0
+156.0,25.0
+158.0,25.0
+158.0,26.0
+159.0,26.0
+159.0,27.0
+161.0,27.0
+161.0,28.0
+164.0,28.0
+164.0,29.0
+166.0,29.0
+166.0,30.0
+2000.000002,30.0
+					</series>
+					<series title="" type="l" color="0xff3636" encoding="csv">0.0,0.0
+21.0,0.0
+21.0,1.0
+22.0,1.0
+22.0,2.0
+23.0,2.0
+23.0,3.0
+47.0,3.0
+47.0,4.0
+49.0,4.0
+49.0,5.0
+73.0,5.0
+73.0,6.0
+101.96852066135034,6.0
+101.96852066135034,7.0
+103.96852066135034,7.0
+103.96852066135034,8.0
+130.96852066135034,8.0
+130.96852066135034,9.0
+2000.000002,9.0
+					</series>
+					<series title="" type="l" color="0xff3737" encoding="csv">0.0,0.0
+23.0,0.0
+23.0,1.0
+44.0,1.0
+44.0,2.0
+45.0,2.0
+45.0,3.0
+69.0,3.0
+69.0,4.0
+90.48200483131222,4.0
+90.48200483131222,5.0
+92.48200483131222,5.0
+92.48200483131222,6.0
+94.48200483131222,6.0
+94.48200483131222,7.0
+95.48200483131222,7.0
+95.48200483131222,8.0
+97.48200483131222,8.0
+97.48200483131222,9.0
+99.48200483131222,9.0
+99.48200483131222,10.0
+100.48200483131222,10.0
+100.48200483131222,11.0
+101.48200483131222,11.0
+101.48200483131222,12.0
+102.48200483131222,12.0
+102.48200483131222,13.0
+123.48200483131222,13.0
+123.48200483131222,14.0
+124.48200483131222,14.0
+124.48200483131222,15.0
+125.48200483131222,15.0
+125.48200483131222,16.0
+126.48200483131222,16.0
+126.48200483131222,17.0
+127.48200483131222,17.0
+127.48200483131222,18.0
+128.48200483131222,18.0
+128.48200483131222,19.0
+130.48200483131222,19.0
+130.48200483131222,20.0
+2000.000002,20.0
+					</series>
+					<series title="" type="l" color="0xff3838" encoding="csv">0.0,0.0
+22.0,0.0
+22.0,1.0
+23.0,1.0
+23.0,2.0
+25.0,2.0
+25.0,3.0
+26.0,3.0
+26.0,4.0
+48.0,4.0
+48.0,5.0
+74.0,5.0
+74.0,6.0
+97.0,6.0
+97.0,7.0
+98.0,7.0
+98.0,8.0
+102.0,8.0
+102.0,9.0
+105.0,9.0
+105.0,10.0
+106.0,10.0
+106.0,11.0
+109.0,11.0
+109.0,12.0
+110.0,12.0
+110.0,13.0
+111.0,13.0
+111.0,14.0
+112.0,14.0
+112.0,15.0
+134.0,15.0
+134.0,16.0
+135.0,16.0
+135.0,17.0
+137.0,17.0
+137.0,18.0
+2000.000002,18.0
+					</series>
+					<series title="" type="l" color="0xff3939" encoding="csv">0.0,0.0
+21.0,0.0
+21.0,1.0
+23.0,1.0
+23.0,2.0
+25.0,2.0
+25.0,3.0
+29.0,3.0
+29.0,4.0
+51.0,4.0
+51.0,5.0
+52.0,5.0
+52.0,6.0
+55.0,6.0
+55.0,7.0
+58.0,7.0
+58.0,8.0
+63.0,8.0
+63.0,9.0
+64.0,9.0
+64.0,10.0
+65.0,10.0
+65.0,11.0
+67.0,11.0
+67.0,12.0
+88.0,12.0
+88.0,13.0
+90.0,13.0
+90.0,14.0
+91.0,14.0
+91.0,15.0
+93.0,15.0
+93.0,16.0
+95.0,16.0
+95.0,17.0
+96.0,17.0
+96.0,18.0
+98.0,18.0
+98.0,19.0
+119.0,19.0
+119.0,20.0
+120.0,20.0
+120.0,21.0
+122.0,21.0
+122.0,22.0
+125.0,22.0
+125.0,23.0
+126.0,23.0
+126.0,24.0
+129.0,24.0
+129.0,25.0
+132.0,25.0
+132.0,26.0
+133.0,26.0
+133.0,27.0
+156.0,27.0
+156.0,28.0
+157.0,28.0
+157.0,29.0
+158.0,29.0
+158.0,30.0
+160.0,30.0
+160.0,31.0
+161.0,31.0
+161.0,32.0
+162.0,32.0
+162.0,33.0
+164.0,33.0
+164.0,34.0
+2000.000002,34.0
+					</series>
+					<series title="" type="l" color="0xff3a3a" encoding="csv">0.0,0.0
+21.0,0.0
+21.0,1.0
+25.0,1.0
+25.0,2.0
+27.0,2.0
+27.0,3.0
+28.0,3.0
+28.0,4.0
+30.0,4.0
+30.0,5.0
+32.0,5.0
+32.0,6.0
+33.0,6.0
+33.0,7.0
+54.0,7.0
+54.0,8.0
+55.0,8.0
+55.0,9.0
+56.0,9.0
+56.0,10.0
+57.0,10.0
+57.0,11.0
+81.92848345483509,11.0
+81.92848345483509,12.0
+104.92848345483509,12.0
+104.92848345483509,13.0
+126.58743756269237,13.0
+126.58743756269237,14.0
+127.58743756269237,14.0
+127.58743756269237,15.0
+128.58743756269237,15.0
+128.58743756269237,16.0
+130.58743756269237,16.0
+130.58743756269237,17.0
+132.58743756269237,17.0
+132.58743756269237,18.0
+134.58743756269237,18.0
+134.58743756269237,19.0
+135.58743756269237,19.0
+135.58743756269237,20.0
+2000.000002,20.0
+					</series>
+					<series title="" type="l" color="0xff3b3b" encoding="csv">0.0,0.0
+21.0,0.0
+21.0,1.0
+22.0,1.0
+22.0,2.0
+23.0,2.0
+23.0,3.0
+44.0,3.0
+44.0,4.0
+67.0,4.0
+67.0,5.0
+68.0,5.0
+68.0,6.0
+69.0,6.0
+69.0,7.0
+71.0,7.0
+71.0,8.0
+94.0,8.0
+94.0,9.0
+95.0,9.0
+95.0,10.0
+99.0,10.0
+99.0,11.0
+100.0,11.0
+100.0,12.0
+102.0,12.0
+102.0,13.0
+106.0,13.0
+106.0,14.0
+107.0,14.0
+107.0,15.0
+108.0,15.0
+108.0,16.0
+109.0,16.0
+109.0,17.0
+130.0,17.0
+130.0,18.0
+132.0,18.0
+132.0,19.0
+133.0,19.0
+133.0,20.0
+134.0,20.0
+134.0,21.0
+135.0,21.0
+135.0,22.0
+136.0,22.0
+136.0,23.0
+139.0,23.0
+139.0,24.0
+2000.000002,24.0
+					</series>
+					<series title="" type="l" color="0xff3c3c" encoding="csv">0.0,0.0
+21.0,0.0
+21.0,1.0
+22.0,1.0
+22.0,2.0
+23.0,2.0
+23.0,3.0
+46.0,3.0
+46.0,4.0
+68.0,4.0
+68.0,5.0
+91.0,5.0
+91.0,6.0
+92.0,6.0
+92.0,7.0
+93.0,7.0
+93.0,8.0
+94.0,8.0
+94.0,9.0
+95.0,9.0
+95.0,10.0
+96.0,10.0
+96.0,11.0
+97.0,11.0
+97.0,12.0
+101.0,12.0
+101.0,13.0
+105.0,13.0
+105.0,14.0
+106.0,14.0
+106.0,15.0
+131.0,15.0
+131.0,16.0
+2000.000002,16.0
+					</series>
+					<series title="" type="l" color="0xff3d3d" encoding="csv">0.0,0.0
+21.0,0.0
+21.0,1.0
+23.0,1.0
+23.0,2.0
+24.0,2.0
+24.0,3.0
+46.0,3.0
+46.0,4.0
+69.0,4.0
+69.0,5.0
+92.0,5.0
+92.0,6.0
+93.0,6.0
+93.0,7.0
+94.0,7.0
+94.0,8.0
+115.0,8.0
+115.0,9.0
+116.0,9.0
+116.0,10.0
+121.0,10.0
+121.0,11.0
+122.0,11.0
+122.0,12.0
+123.0,12.0
+123.0,13.0
+125.0,13.0
+125.0,14.0
+127.0,14.0
+127.0,15.0
+130.0,15.0
+130.0,16.0
+131.0,16.0
+131.0,17.0
+2000.000002,17.0
+					</series>
+					<series title="" type="l" color="0xff3e3e" encoding="csv">0.0,0.0
+21.0,0.0
+21.0,1.0
+44.0,1.0
+44.0,2.0
+67.0,2.0
+67.0,3.0
+68.0,3.0
+68.0,4.0
+72.0,4.0
+72.0,5.0
+73.0,5.0
+73.0,6.0
+74.0,6.0
+74.0,7.0
+95.0,7.0
+95.0,8.0
+96.0,8.0
+96.0,9.0
+97.0,9.0
+97.0,10.0
+119.0,10.0
+119.0,11.0
+122.0,11.0
+122.0,12.0
+123.0,12.0
+123.0,13.0
+124.0,13.0
+124.0,14.0
+126.0,14.0
+126.0,15.0
+127.0,15.0
+127.0,16.0
+129.0,16.0
+129.0,17.0
+130.0,17.0
+130.0,18.0
+131.0,18.0
+131.0,19.0
+2000.000002,19.0
+					</series>
+					<series title="" type="l" color="0xff3e3e" encoding="csv">0.0,0.0
+21.0,0.0
+21.0,1.0
+22.0,1.0
+22.0,2.0
+25.0,2.0
+25.0,3.0
+28.0,3.0
+28.0,4.0
+50.0,4.0
+50.0,5.0
+71.0,5.0
+71.0,6.0
+77.0,6.0
+77.0,7.0
+78.0,7.0
+78.0,8.0
+79.0,8.0
+79.0,9.0
+102.77137078040217,9.0
+102.77137078040217,10.0
+123.77137078040217,10.0
+123.77137078040217,11.0
+125.77137078040217,11.0
+125.77137078040217,12.0
+126.77137078040217,12.0
+126.77137078040217,13.0
+128.77137078040215,13.0
+128.77137078040215,14.0
+129.77137078040215,14.0
+129.77137078040215,15.0
+130.77137078040215,15.0
+130.77137078040215,16.0
+131.77137078040215,16.0
+131.77137078040215,17.0
+132.77137078040215,17.0
+132.77137078040215,18.0
+2000.000002,18.0
+					</series>
+					<series title="" type="l" color="0xff3f3f" encoding="csv">0.0,0.0
+21.0,0.0
+21.0,1.0
+23.0,1.0
+23.0,2.0
+24.0,2.0
+24.0,3.0
+46.0,3.0
+46.0,4.0
+72.0,4.0
+72.0,5.0
+74.0,5.0
+74.0,6.0
+80.0,6.0
+80.0,7.0
+81.0,7.0
+81.0,8.0
+87.0,8.0
+87.0,9.0
+88.0,9.0
+88.0,10.0
+89.0,10.0
+89.0,11.0
+110.0,11.0
+110.0,12.0
+111.0,12.0
+111.0,13.0
+113.0,13.0
+113.0,14.0
+115.0,14.0
+115.0,15.0
+119.0,15.0
+119.0,16.0
+120.0,16.0
+120.0,17.0
+121.0,17.0
+121.0,18.0
+125.0,18.0
+125.0,19.0
+128.0,19.0
+128.0,20.0
+129.0,20.0
+129.0,21.0
+130.0,21.0
+130.0,22.0
+132.0,22.0
+132.0,23.0
+133.0,23.0
+133.0,24.0
+154.0,24.0
+154.0,25.0
+155.0,25.0
+155.0,26.0
+156.0,26.0
+156.0,27.0
+157.0,27.0
+157.0,28.0
+2000.000002,28.0
+					</series>
+					<series title="" type="l" color="0xff4040" encoding="csv">0.0,0.0
+21.0,0.0
+21.0,1.0
+22.0,1.0
+22.0,2.0
+23.0,2.0
+23.0,3.0
+47.0,3.0
+47.0,4.0
+48.0,4.0
+48.0,5.0
+49.0,5.0
+49.0,6.0
+51.0,6.0
+51.0,7.0
+55.0,7.0
+55.0,8.0
+57.0,8.0
+57.0,9.0
+62.0,9.0
+62.0,10.0
+64.0,10.0
+64.0,11.0
+65.0,11.0
+65.0,12.0
+66.0,12.0
+66.0,13.0
+67.0,13.0
+67.0,14.0
+89.0,14.0
+89.0,15.0
+91.0,15.0
+91.0,16.0
+94.0,16.0
+94.0,17.0
+95.0,17.0
+95.0,18.0
+96.0,18.0
+96.0,19.0
+99.0,19.0
+99.0,20.0
+122.0,20.0
+122.0,21.0
+127.0,21.0
+127.0,22.0
+128.0,22.0
+128.0,23.0
+129.0,23.0
+129.0,24.0
+151.0,24.0
+151.0,25.0
+152.0,25.0
+152.0,26.0
+154.0,26.0
+154.0,27.0
+155.0,27.0
+155.0,28.0
+156.0,28.0
+156.0,29.0
+157.0,29.0
+157.0,30.0
+158.0,30.0
+158.0,31.0
+163.0,31.0
+163.0,32.0
+164.0,32.0
+164.0,33.0
+165.0,33.0
+165.0,34.0
+2000.000002,34.0
+					</series>
+					<series title="" type="l" color="0xff4141" encoding="csv">0.0,0.0
+23.0,0.0
+23.0,1.0
+24.0,1.0
+24.0,2.0
+26.0,2.0
+26.0,3.0
+27.0,3.0
+27.0,4.0
+50.0,4.0
+50.0,5.0
+54.0,5.0
+54.0,6.0
+56.0,6.0
+56.0,7.0
+59.0,7.0
+59.0,8.0
+84.0,8.0
+84.0,9.0
+85.0,9.0
+85.0,10.0
+107.0,10.0
+107.0,11.0
+111.0,11.0
+111.0,12.0
+113.0,12.0
+113.0,13.0
+116.0,13.0
+116.0,14.0
+117.0,14.0
+117.0,15.0
+118.0,15.0
+118.0,16.0
+119.0,16.0
+119.0,17.0
+120.0,17.0
+120.0,18.0
+142.0,18.0
+142.0,19.0
+147.0,19.0
+147.0,20.0
+150.0,20.0
+150.0,21.0
+151.0,21.0
+151.0,22.0
+153.0,22.0
+153.0,23.0
+154.0,23.0
+154.0,24.0
+156.0,24.0
+156.0,25.0
+157.0,25.0
+157.0,26.0
+161.0,26.0
+161.0,27.0
+162.0,27.0
+162.0,28.0
+2000.000002,28.0
+					</series>
+					<series title="" type="l" color="0xff4242" encoding="csv">0.0,0.0
+24.0,0.0
+24.0,1.0
+25.0,1.0
+25.0,2.0
+26.0,2.0
+26.0,3.0
+32.0,3.0
+32.0,4.0
+54.0,4.0
+54.0,5.0
+55.0,5.0
+55.0,6.0
+61.0,6.0
+61.0,7.0
+85.0,7.0
+85.0,8.0
+87.0,8.0
+87.0,9.0
+88.0,9.0
+88.0,10.0
+112.0,10.0
+112.0,11.0
+113.0,11.0
+113.0,12.0
+114.0,12.0
+114.0,13.0
+138.0,13.0
+138.0,14.0
+2000.000002,14.0
+					</series>
+					<series title="" type="l" color="0xff4343" encoding="csv">0.0,0.0
+21.0,0.0
+21.0,1.0
+22.0,1.0
+22.0,2.0
+24.0,2.0
+24.0,3.0
+25.0,3.0
+25.0,4.0
+29.0,4.0
+29.0,5.0
+31.0,5.0
+31.0,6.0
+34.0,6.0
+34.0,7.0
+56.0,7.0
+56.0,8.0
+58.0,8.0
+58.0,9.0
+62.0,9.0
+62.0,10.0
+64.0,10.0
+64.0,11.0
+65.0,11.0
+65.0,12.0
+66.0,12.0
+66.0,13.0
+88.0,13.0
+88.0,14.0
+89.0,14.0
+89.0,15.0
+90.0,15.0
+90.0,16.0
+91.0,16.0
+91.0,17.0
+117.0,17.0
+117.0,18.0
+118.0,18.0
+118.0,19.0
+119.0,19.0
+119.0,20.0
+121.0,20.0
+121.0,21.0
+122.0,21.0
+122.0,22.0
+124.0,22.0
+124.0,23.0
+125.0,23.0
+125.0,24.0
+127.0,24.0
+127.0,25.0
+148.0,25.0
+148.0,26.0
+149.0,26.0
+149.0,27.0
+150.0,27.0
+150.0,28.0
+151.0,28.0
+151.0,29.0
+152.0,29.0
+152.0,30.0
+156.0,30.0
+156.0,31.0
+157.0,31.0
+157.0,32.0
+160.0,32.0
+160.0,33.0
+165.0,33.0
+165.0,34.0
+166.0,34.0
+166.0,35.0
+2000.000002,35.0
+					</series>
+					<series title="" type="l" color="0xff4444" encoding="csv">0.0,0.0
+21.0,0.0
+21.0,1.0
+22.0,1.0
+22.0,2.0
+25.0,2.0
+25.0,3.0
+46.0,3.0
+46.0,4.0
+70.0,4.0
+70.0,5.0
+71.0,5.0
+71.0,6.0
+72.0,6.0
+72.0,7.0
+73.0,7.0
+73.0,8.0
+96.0,8.0
+96.0,9.0
+97.0,9.0
+97.0,10.0
+98.0,10.0
+98.0,11.0
+99.0,11.0
+99.0,12.0
+100.0,12.0
+100.0,13.0
+101.0,13.0
+101.0,14.0
+102.0,14.0
+102.0,15.0
+126.0,15.0
+126.0,16.0
+128.0,16.0
+128.0,17.0
+133.0,17.0
+133.0,18.0
+2000.000002,18.0
+					</series>
+					<series title="" type="l" color="0xff4545" encoding="csv">0.0,0.0
+24.0,0.0
+24.0,1.0
+25.0,1.0
+25.0,2.0
+27.0,2.0
+27.0,3.0
+28.0,3.0
+28.0,4.0
+29.0,4.0
+29.0,5.0
+52.0,5.0
+52.0,6.0
+54.0,6.0
+54.0,7.0
+59.0,7.0
+59.0,8.0
+60.0,8.0
+60.0,9.0
+61.0,9.0
+61.0,10.0
+85.0,10.0
+85.0,11.0
+86.0,11.0
+86.0,12.0
+87.0,12.0
+87.0,13.0
+109.0,13.0
+109.0,14.0
+111.0,14.0
+111.0,15.0
+112.0,15.0
+112.0,16.0
+114.0,16.0
+114.0,17.0
+115.0,17.0
+115.0,18.0
+117.0,18.0
+117.0,19.0
+139.0,19.0
+139.0,20.0
+2000.000002,20.0
+					</series>
+					<series title="" type="l" color="0xff4646" encoding="csv">0.0,0.0
+25.0,0.0
+25.0,1.0
+26.0,1.0
+26.0,2.0
+34.0,2.0
+34.0,3.0
+35.0,3.0
+35.0,4.0
+36.0,4.0
+36.0,5.0
+38.0,5.0
+38.0,6.0
+61.0,6.0
+61.0,7.0
+64.0,7.0
+64.0,8.0
+66.0,8.0
+66.0,9.0
+70.0,9.0
+70.0,10.0
+72.0,10.0
+72.0,11.0
+73.0,11.0
+73.0,12.0
+74.0,12.0
+74.0,13.0
+95.0,13.0
+95.0,14.0
+97.0,14.0
+97.0,15.0
+100.0,15.0
+100.0,16.0
+101.0,16.0
+101.0,17.0
+106.0,17.0
+106.0,18.0
+107.0,18.0
+107.0,19.0
+108.0,19.0
+108.0,20.0
+129.0,20.0
+129.0,21.0
+130.0,21.0
+130.0,22.0
+131.0,22.0
+131.0,23.0
+156.0,23.0
+156.0,24.0
+159.0,24.0
+159.0,25.0
+162.0,25.0
+162.0,26.0
+2000.000002,26.0
+					</series>
+					<series title="" type="l" color="0xff4747" encoding="csv">0.0,0.0
+22.0,0.0
+22.0,1.0
+24.0,1.0
+24.0,2.0
+27.0,2.0
+27.0,3.0
+30.0,3.0
+30.0,4.0
+32.0,4.0
+32.0,5.0
+33.0,5.0
+33.0,6.0
+35.0,6.0
+35.0,7.0
+38.0,7.0
+38.0,8.0
+41.0,8.0
+41.0,9.0
+43.0,9.0
+43.0,10.0
+47.0,10.0
+47.0,11.0
+68.0,11.0
+68.0,12.0
+69.0,12.0
+69.0,13.0
+92.0,13.0
+92.0,14.0
+94.0,14.0
+94.0,15.0
+115.0,15.0
+115.0,16.0
+116.0,16.0
+116.0,17.0
+117.0,17.0
+117.0,18.0
+120.0,18.0
+120.0,19.0
+121.0,19.0
+121.0,20.0
+122.0,20.0
+122.0,21.0
+144.0,21.0
+144.0,22.0
+148.0,22.0
+148.0,23.0
+149.0,23.0
+149.0,24.0
+152.0,24.0
+152.0,25.0
+154.0,25.0
+154.0,26.0
+155.0,26.0
+155.0,27.0
+2000.000002,27.0
+					</series>
+					<series title="" type="l" color="0xff4747" encoding="csv">0.0,0.0
+21.0,0.0
+21.0,1.0
+22.0,1.0
+22.0,2.0
+23.0,2.0
+23.0,3.0
+49.0,3.0
+49.0,4.0
+50.0,4.0
+50.0,5.0
+51.0,5.0
+51.0,6.0
+54.0,6.0
+54.0,7.0
+55.0,7.0
+55.0,8.0
+57.0,8.0
+57.0,9.0
+79.83605037400646,9.0
+79.83605037400646,10.0
+80.83605037400646,10.0
+80.83605037400646,11.0
+101.83605037400646,11.0
+101.83605037400646,12.0
+102.83605037400646,12.0
+102.83605037400646,13.0
+103.83605037400646,13.0
+103.83605037400646,14.0
+104.83605037400646,14.0
+104.83605037400646,15.0
+105.83605037400646,15.0
+105.83605037400646,16.0
+106.83605037400646,16.0
+106.83605037400646,17.0
+107.83605037400646,17.0
+107.83605037400646,18.0
+109.83605037400646,18.0
+109.83605037400646,19.0
+111.83605037400646,19.0
+111.83605037400646,20.0
+113.83605037400646,20.0
+113.83605037400646,21.0
+136.83605037400648,21.0
+136.83605037400648,22.0
+138.83605037400648,22.0
+138.83605037400648,23.0
+139.83605037400648,23.0
+139.83605037400648,24.0
+140.83605037400648,24.0
+140.83605037400648,25.0
+141.83605037400648,25.0
+141.83605037400648,26.0
+2000.000002,26.0
+					</series>
+					<series title="" type="l" color="0xff4848" encoding="csv">0.0,0.0
+22.0,0.0
+22.0,1.0
+24.0,1.0
+24.0,2.0
+27.0,2.0
+27.0,3.0
+29.0,3.0
+29.0,4.0
+30.0,4.0
+30.0,5.0
+51.0,5.0
+51.0,6.0
+52.0,6.0
+52.0,7.0
+53.0,7.0
+53.0,8.0
+54.0,8.0
+54.0,9.0
+56.0,9.0
+56.0,10.0
+77.0,10.0
+77.0,11.0
+98.0,11.0
+98.0,12.0
+99.0,12.0
+99.0,13.0
+104.0,13.0
+104.0,14.0
+105.0,14.0
+105.0,15.0
+106.0,15.0
+106.0,16.0
+127.0,16.0
+127.0,17.0
+128.0,17.0
+128.0,18.0
+132.0,18.0
+132.0,19.0
+133.0,19.0
+133.0,20.0
+136.0,20.0
+136.0,21.0
+137.0,21.0
+137.0,22.0
+139.0,22.0
+139.0,23.0
+2000.000002,23.0
+					</series>
+					<series title="" type="l" color="0xff4949" encoding="csv">0.0,0.0
+22.0,0.0
+22.0,1.0
+23.0,1.0
+23.0,2.0
+24.0,2.0
+24.0,3.0
+45.0,3.0
+45.0,4.0
+67.0,4.0
+67.0,5.0
+70.0,5.0
+70.0,6.0
+91.0,6.0
+91.0,7.0
+94.0,7.0
+94.0,8.0
+96.0,8.0
+96.0,9.0
+98.0,9.0
+98.0,10.0
+119.0,10.0
+119.0,11.0
+122.0,11.0
+122.0,12.0
+124.0,12.0
+124.0,13.0
+126.0,13.0
+126.0,14.0
+129.0,14.0
+129.0,15.0
+130.0,15.0
+130.0,16.0
+131.0,16.0
+131.0,17.0
+133.0,17.0
+133.0,18.0
+134.0,18.0
+134.0,19.0
+2000.000002,19.0
+					</series>
+					<series title="" type="l" color="0xff4a4a" encoding="csv">0.0,0.0
+22.0,0.0
+22.0,1.0
+24.0,1.0
+24.0,2.0
+25.0,2.0
+25.0,3.0
+29.0,3.0
+29.0,4.0
+55.0,4.0
+55.0,5.0
+56.0,5.0
+56.0,6.0
+58.0,6.0
+58.0,7.0
+59.0,7.0
+59.0,8.0
+60.0,8.0
+60.0,9.0
+62.0,9.0
+62.0,10.0
+64.0,10.0
+64.0,11.0
+66.0,11.0
+66.0,12.0
+88.0,12.0
+88.0,13.0
+90.0,13.0
+90.0,14.0
+95.0,14.0
+95.0,15.0
+96.0,15.0
+96.0,16.0
+97.0,16.0
+97.0,17.0
+121.0,17.0
+121.0,18.0
+124.0,18.0
+124.0,19.0
+126.0,19.0
+126.0,20.0
+127.0,20.0
+127.0,21.0
+131.0,21.0
+131.0,22.0
+135.0,22.0
+135.0,23.0
+139.0,23.0
+139.0,24.0
+140.0,24.0
+140.0,25.0
+141.0,25.0
+141.0,26.0
+162.0,26.0
+162.0,27.0
+163.0,27.0
+163.0,28.0
+165.0,28.0
+165.0,29.0
+2000.000002,29.0
+					</series>
+					<series title="" type="l" color="0xff4b4b" encoding="csv">0.0,0.0
+21.0,0.0
+21.0,1.0
+22.0,1.0
+22.0,2.0
+24.0,2.0
+24.0,3.0
+25.0,3.0
+25.0,4.0
+49.0,4.0
+49.0,5.0
+50.0,5.0
+50.0,6.0
+51.0,6.0
+51.0,7.0
+52.0,7.0
+52.0,8.0
+53.0,8.0
+53.0,9.0
+54.0,9.0
+54.0,10.0
+55.0,10.0
+55.0,11.0
+79.0,11.0
+79.0,12.0
+81.0,12.0
+81.0,13.0
+104.0,13.0
+104.0,14.0
+126.0,14.0
+126.0,15.0
+127.0,15.0
+127.0,16.0
+133.0,16.0
+133.0,17.0
+134.0,17.0
+134.0,18.0
+136.0,18.0
+136.0,19.0
+2000.000002,19.0
+					</series>
+					<series title="" type="l" color="0xff4c4c" encoding="csv">0.0,0.0
+21.0,0.0
+21.0,1.0
+26.0,1.0
+26.0,2.0
+27.0,2.0
+27.0,3.0
+28.0,3.0
+28.0,4.0
+52.0,4.0
+52.0,5.0
+53.0,5.0
+53.0,6.0
+54.0,6.0
+54.0,7.0
+57.0,7.0
+57.0,8.0
+59.0,8.0
+59.0,9.0
+60.0,9.0
+60.0,10.0
+61.0,10.0
+61.0,11.0
+64.0,11.0
+64.0,12.0
+65.0,12.0
+65.0,13.0
+86.0,13.0
+86.0,14.0
+87.0,14.0
+87.0,15.0
+88.0,15.0
+88.0,16.0
+91.0,16.0
+91.0,17.0
+92.0,17.0
+92.0,18.0
+93.0,18.0
+93.0,19.0
+94.0,19.0
+94.0,20.0
+116.0,20.0
+116.0,21.0
+118.0,21.0
+118.0,22.0
+121.0,22.0
+121.0,23.0
+123.0,23.0
+123.0,24.0
+146.0,24.0
+146.0,25.0
+149.0,25.0
+149.0,26.0
+151.0,26.0
+151.0,27.0
+155.0,27.0
+155.0,28.0
+157.0,28.0
+157.0,29.0
+158.0,29.0
+158.0,30.0
+159.0,30.0
+159.0,31.0
+161.0,31.0
+161.0,32.0
+2000.000002,32.0
+					</series>
+					<series title="" type="l" color="0xff4d4d" encoding="csv">0.0,0.0
+23.0,0.0
+23.0,1.0
+24.0,1.0
+24.0,2.0
+25.0,2.0
+25.0,3.0
+27.0,3.0
+27.0,4.0
+30.0,4.0
+30.0,5.0
+31.0,5.0
+31.0,6.0
+35.0,6.0
+35.0,7.0
+36.0,7.0
+36.0,8.0
+39.0,8.0
+39.0,9.0
+40.0,9.0
+40.0,10.0
+61.0,10.0
+61.0,11.0
+68.0,11.0
+68.0,12.0
+92.0,12.0
+92.0,13.0
+96.0,13.0
+96.0,14.0
+100.0,14.0
+100.0,15.0
+106.0,15.0
+106.0,16.0
+110.0,16.0
+110.0,17.0
+111.0,17.0
+111.0,18.0
+112.0,18.0
+112.0,19.0
+113.0,19.0
+113.0,20.0
+116.0,20.0
+116.0,21.0
+137.0,21.0
+137.0,22.0
+159.0,22.0
+159.0,23.0
+2000.000002,23.0
+					</series>
+					<series title="" type="l" color="0xff4e4e" encoding="csv">0.0,0.0
+21.0,0.0
+21.0,1.0
+45.0,1.0
+45.0,2.0
+46.0,2.0
+46.0,3.0
+50.0,3.0
+50.0,4.0
+52.0,4.0
+52.0,5.0
+54.0,5.0
+54.0,6.0
+56.0,6.0
+56.0,7.0
+58.0,7.0
+58.0,8.0
+62.0,8.0
+62.0,9.0
+63.0,9.0
+63.0,10.0
+84.0,10.0
+84.0,11.0
+85.0,11.0
+85.0,12.0
+109.0,12.0
+109.0,13.0
+112.0,13.0
+112.0,14.0
+113.0,14.0
+113.0,15.0
+135.0,15.0
+135.0,16.0
+2000.000002,16.0
+					</series>
+					<series title="" type="l" color="0xff4f4f" encoding="csv">0.0,0.0
+23.0,0.0
+23.0,1.0
+49.0,1.0
+49.0,2.0
+50.0,2.0
+50.0,3.0
+52.0,3.0
+52.0,4.0
+53.0,4.0
+53.0,5.0
+54.0,5.0
+54.0,6.0
+55.0,6.0
+55.0,7.0
+56.0,7.0
+56.0,8.0
+60.0,8.0
+60.0,9.0
+81.0,9.0
+81.0,10.0
+82.0,10.0
+82.0,11.0
+83.0,11.0
+83.0,12.0
+84.0,12.0
+84.0,13.0
+86.0,13.0
+86.0,14.0
+107.0,14.0
+107.0,15.0
+129.0,15.0
+129.0,16.0
+131.0,16.0
+131.0,17.0
+132.0,17.0
+132.0,18.0
+2000.000002,18.0
+					</series>
+					<series title="" type="l" color="0xff4f4f" encoding="csv">0.0,0.0
+22.0,0.0
+22.0,1.0
+23.0,1.0
+23.0,2.0
+24.0,2.0
+24.0,3.0
+27.0,3.0
+27.0,4.0
+30.0,4.0
+30.0,5.0
+52.0,5.0
+52.0,6.0
+53.0,6.0
+53.0,7.0
+55.0,7.0
+55.0,8.0
+59.0,8.0
+59.0,9.0
+60.0,9.0
+60.0,10.0
+83.0,10.0
+83.0,11.0
+84.0,11.0
+84.0,12.0
+86.0,12.0
+86.0,13.0
+88.0,13.0
+88.0,14.0
+89.0,14.0
+89.0,15.0
+110.0,15.0
+110.0,16.0
+113.0,16.0
+113.0,17.0
+115.0,17.0
+115.0,18.0
+117.0,18.0
+117.0,19.0
+118.0,19.0
+118.0,20.0
+119.0,20.0
+119.0,21.0
+142.62412317004055,21.0
+142.62412317004055,22.0
+145.62412317004055,22.0
+145.62412317004055,23.0
+149.62412317004055,23.0
+149.62412317004055,24.0
+152.62412317004055,24.0
+152.62412317004055,25.0
+154.62412317004055,25.0
+154.62412317004055,26.0
+2000.000002,26.0
+					</series>
+					<series title="" type="l" color="0xff5050" encoding="csv">0.0,0.0
+24.0,0.0
+24.0,1.0
+25.0,1.0
+25.0,2.0
+27.0,2.0
+27.0,3.0
+30.0,3.0
+30.0,4.0
+52.0,4.0
+52.0,5.0
+55.0,5.0
+55.0,6.0
+56.0,6.0
+56.0,7.0
+61.0,7.0
+61.0,8.0
+62.0,8.0
+62.0,9.0
+84.0,9.0
+84.0,10.0
+86.0,10.0
+86.0,11.0
+108.0,11.0
+108.0,12.0
+111.0,12.0
+111.0,13.0
+115.0,13.0
+115.0,14.0
+118.0,14.0
+118.0,15.0
+139.0,15.0
+139.0,16.0
+2000.000002,16.0
+					</series>
+					<series title="" type="l" color="0xff5151" encoding="csv">0.0,0.0
+22.0,0.0
+22.0,1.0
+24.0,1.0
+24.0,2.0
+26.0,2.0
+26.0,3.0
+27.0,3.0
+27.0,4.0
+30.0,4.0
+30.0,5.0
+32.0,5.0
+32.0,6.0
+33.0,6.0
+33.0,7.0
+34.0,7.0
+34.0,8.0
+37.0,8.0
+37.0,9.0
+38.0,9.0
+38.0,10.0
+59.0,10.0
+59.0,11.0
+60.0,11.0
+60.0,12.0
+61.0,12.0
+61.0,13.0
+62.0,13.0
+62.0,14.0
+66.0,14.0
+66.0,15.0
+67.0,15.0
+67.0,16.0
+89.0,16.0
+89.0,17.0
+91.0,17.0
+91.0,18.0
+93.0,18.0
+93.0,19.0
+94.0,19.0
+94.0,20.0
+95.0,20.0
+95.0,21.0
+118.0,21.0
+118.0,22.0
+121.0,22.0
+121.0,23.0
+123.0,23.0
+123.0,24.0
+124.0,24.0
+124.0,25.0
+125.0,25.0
+125.0,26.0
+146.0,26.0
+146.0,27.0
+148.0,27.0
+148.0,28.0
+151.0,28.0
+151.0,29.0
+160.0,29.0
+160.0,30.0
+162.0,30.0
+162.0,31.0
+2000.000002,31.0
+					</series>
+					<series title="" type="l" color="0xff5252" encoding="csv">0.0,0.0
+21.0,0.0
+21.0,1.0
+22.0,1.0
+22.0,2.0
+25.0,2.0
+25.0,3.0
+26.0,3.0
+26.0,4.0
+27.0,4.0
+27.0,5.0
+50.97044352511875,5.0
+50.97044352511875,6.0
+71.97044352511875,6.0
+71.97044352511875,7.0
+72.97044352511875,7.0
+72.97044352511875,8.0
+93.97044352511875,8.0
+93.97044352511875,9.0
+94.97044352511875,9.0
+94.97044352511875,10.0
+95.97044352511875,10.0
+95.97044352511875,11.0
+116.97044352511875,11.0
+116.97044352511875,12.0
+118.97044352511875,12.0
+118.97044352511875,13.0
+120.97044352511875,13.0
+120.97044352511875,14.0
+2000.000002,14.0
+					</series>
+					<series title="" type="l" color="0xff5353" encoding="csv">0.0,0.0
+22.0,0.0
+22.0,1.0
+24.0,1.0
+24.0,2.0
+27.0,2.0
+27.0,3.0
+28.0,3.0
+28.0,4.0
+29.0,4.0
+29.0,5.0
+56.0,5.0
+56.0,6.0
+59.0,6.0
+59.0,7.0
+60.0,7.0
+60.0,8.0
+62.0,8.0
+62.0,9.0
+83.0,9.0
+83.0,10.0
+88.0,10.0
+88.0,11.0
+93.0,11.0
+93.0,12.0
+94.0,12.0
+94.0,13.0
+118.0,13.0
+118.0,14.0
+119.0,14.0
+119.0,15.0
+120.0,15.0
+120.0,16.0
+142.2255867922213,16.0
+142.2255867922213,17.0
+145.2255867922213,17.0
+145.2255867922213,18.0
+146.2255867922213,18.0
+146.2255867922213,19.0
+147.2255867922213,19.0
+147.2255867922213,20.0
+150.2255867922213,20.0
+150.2255867922213,21.0
+2000.000002,21.0
+					</series>
+					<series title="" type="l" color="0xff5454" encoding="csv">0.0,0.0
+26.0,0.0
+26.0,1.0
+29.0,1.0
+29.0,2.0
+54.0,2.0
+54.0,3.0
+55.0,3.0
+55.0,4.0
+57.0,4.0
+57.0,5.0
+58.0,5.0
+58.0,6.0
+61.0,6.0
+61.0,7.0
+62.0,7.0
+62.0,8.0
+63.0,8.0
+63.0,9.0
+87.0,9.0
+87.0,10.0
+88.0,10.0
+88.0,11.0
+109.0,11.0
+109.0,12.0
+110.0,12.0
+110.0,13.0
+111.0,13.0
+111.0,14.0
+112.0,14.0
+112.0,15.0
+133.0,15.0
+133.0,16.0
+135.0,16.0
+135.0,17.0
+136.0,17.0
+136.0,18.0
+137.0,18.0
+137.0,19.0
+141.0,19.0
+141.0,20.0
+142.0,20.0
+142.0,21.0
+145.0,21.0
+145.0,22.0
+2000.000002,22.0
+					</series>
+					<series title="" type="l" color="0xff5555" encoding="csv">0.0,0.0
+21.0,0.0
+21.0,1.0
+24.0,1.0
+24.0,2.0
+25.0,2.0
+25.0,3.0
+26.0,3.0
+26.0,4.0
+27.0,4.0
+27.0,5.0
+49.92852862901054,5.0
+49.92852862901054,6.0
+50.92852862901054,6.0
+50.92852862901054,7.0
+76.92852862901054,7.0
+76.92852862901054,8.0
+98.92852862901054,8.0
+98.92852862901054,9.0
+99.92852862901054,9.0
+99.92852862901054,10.0
+100.92852862901054,10.0
+100.92852862901054,11.0
+102.92852862901054,11.0
+102.92852862901054,12.0
+104.92852862901054,12.0
+104.92852862901054,13.0
+105.92852862901054,13.0
+105.92852862901054,14.0
+106.92852862901054,14.0
+106.92852862901054,15.0
+108.92852862901054,15.0
+108.92852862901054,16.0
+109.92852862901054,16.0
+109.92852862901054,17.0
+131.92852862901054,17.0
+131.92852862901054,18.0
+2000.000002,18.0
+					</series>
+					<series title="" type="l" color="0xff5656" encoding="csv">0.0,0.0
+21.0,0.0
+21.0,1.0
+22.0,1.0
+22.0,2.0
+23.0,2.0
+23.0,3.0
+44.0,3.0
+44.0,4.0
+71.0,4.0
+71.0,5.0
+72.0,5.0
+72.0,6.0
+74.0,6.0
+74.0,7.0
+96.0,7.0
+96.0,8.0
+98.0,8.0
+98.0,9.0
+101.0,9.0
+101.0,10.0
+122.0,10.0
+122.0,11.0
+124.0,11.0
+124.0,12.0
+126.0,12.0
+126.0,13.0
+2000.000002,13.0
+					</series>
+					<series title="" type="l" color="0xff5757" encoding="csv">0.0,0.0
+22.0,0.0
+22.0,1.0
+23.0,1.0
+23.0,2.0
+24.0,2.0
+24.0,3.0
+46.0,3.0
+46.0,4.0
+68.0,4.0
+68.0,5.0
+69.0,5.0
+69.0,6.0
+70.0,6.0
+70.0,7.0
+91.0,7.0
+91.0,8.0
+92.0,8.0
+92.0,9.0
+93.0,9.0
+93.0,10.0
+94.0,10.0
+94.0,11.0
+95.0,11.0
+95.0,12.0
+118.0,12.0
+118.0,13.0
+121.0,13.0
+121.0,14.0
+122.0,14.0
+122.0,15.0
+123.0,15.0
+123.0,16.0
+125.0,16.0
+125.0,17.0
+127.0,17.0
+127.0,18.0
+129.0,18.0
+129.0,19.0
+131.0,19.0
+131.0,20.0
+2000.000002,20.0
+					</series>
+					<series title="" type="l" color="0xff5757" encoding="csv">0.0,0.0
+21.0,0.0
+21.0,1.0
+23.0,1.0
+23.0,2.0
+26.0,2.0
+26.0,3.0
+47.0,3.0
+47.0,4.0
+68.0,4.0
+68.0,5.0
+69.0,5.0
+69.0,6.0
+94.0,6.0
+94.0,7.0
+96.0,7.0
+96.0,8.0
+97.0,8.0
+97.0,9.0
+98.0,9.0
+98.0,10.0
+119.0,10.0
+119.0,11.0
+122.0,11.0
+122.0,12.0
+124.0,12.0
+124.0,13.0
+126.0,13.0
+126.0,14.0
+2000.000002,14.0
+					</series>
+					<series title="" type="l" color="0xff5858" encoding="csv">0.0,0.0
+22.0,0.0
+22.0,1.0
+26.0,1.0
+26.0,2.0
+28.0,2.0
+28.0,3.0
+29.0,3.0
+29.0,4.0
+30.0,4.0
+30.0,5.0
+33.0,5.0
+33.0,6.0
+35.0,6.0
+35.0,7.0
+57.0,7.0
+57.0,8.0
+59.0,8.0
+59.0,9.0
+62.0,9.0
+62.0,10.0
+87.0,10.0
+87.0,11.0
+88.0,11.0
+88.0,12.0
+113.0,12.0
+113.0,13.0
+134.0,13.0
+134.0,14.0
+2000.000002,14.0
+					</series>
+					<series title="lives" type="l" color="0xffff00" encoding="csv">0.0,5.0
+25.0,5.0
+25.0,4.0
+47.0,4.0
+47.0,3.0
+71.0,3.0
+71.0,2.0
+96.0,2.0
+96.0,1.0
+127.0,1.0
+127.0,0.0
+2000.000002,0.0
+					</series>
+					<series title="" type="l" color="0xffff01" encoding="csv">0.0,5.0
+36.0,5.0
+36.0,4.0
+70.0,4.0
+70.0,3.0
+101.0,3.0
+101.0,2.0
+130.0,2.0
+130.0,1.0
+165.0,1.0
+165.0,0.0
+2000.000002,0.0
+					</series>
+					<series title="" type="l" color="0xffff02" encoding="csv">0.0,5.0
+25.0,5.0
+25.0,4.0
+46.0,4.0
+46.0,3.0
+70.0,3.0
+70.0,2.0
+102.0,2.0
+102.0,1.0
+126.0,1.0
+126.0,0.0
+2000.000002,0.0
+					</series>
+					<series title="" type="l" color="0xffff03" encoding="csv">0.0,5.0
+29.0,5.0
+29.0,4.0
+67.0,4.0
+67.0,3.0
+100.0,3.0
+100.0,2.0
+130.0,2.0
+130.0,1.0
+157.0,1.0
+157.0,0.0
+2000.000002,0.0
+					</series>
+					<series title="" type="l" color="0xffff04" encoding="csv">0.0,5.0
+27.0,5.0
+27.0,4.0
+48.0,4.0
+48.0,3.0
+74.0,3.0
+74.0,2.0
+100.0,2.0
+100.0,1.0
+134.0,1.0
+134.0,0.0
+2000.000002,0.0
+					</series>
+					<series title="" type="l" color="0xffff04" encoding="csv">0.0,5.0
+23.0,5.0
+23.0,4.0
+45.542637600330636,4.0
+45.542637600330636,3.0
+77.54263760033064,3.0
+77.54263760033064,2.0
+108.54263760033064,2.0
+108.54263760033064,1.0
+138.54263760033064,1.0
+138.54263760033064,0.0
+2000.000002,0.0
+					</series>
+					<series title="" type="l" color="0xffff05" encoding="csv">0.0,5.0
+25.0,5.0
+25.0,4.0
+46.0,4.0
+46.0,3.0
+69.0,3.0
+69.0,2.0
+93.0,2.0
+93.0,1.0
+120.4408119651489,1.0
+120.4408119651489,0.0
+2000.000002,0.0
+					</series>
+					<series title="" type="l" color="0xffff06" encoding="csv">0.0,5.0
+23.0,5.0
+23.0,4.0
+60.0,4.0
+60.0,3.0
+83.0,3.0
+83.0,2.0
+108.0,2.0
+108.0,1.0
+140.0,1.0
+140.0,0.0
+2000.000002,0.0
+					</series>
+					<series title="" type="l" color="0xffff07" encoding="csv">0.0,5.0
+31.0,5.0
+31.0,4.0
+61.0,4.0
+61.0,3.0
+88.0,3.0
+88.0,2.0
+110.0,2.0
+110.0,1.0
+132.0,1.0
+132.0,0.0
+2000.000002,0.0
+					</series>
+					<series title="" type="l" color="0xffff08" encoding="csv">0.0,5.0
+30.0,5.0
+30.0,4.0
+61.0,4.0
+61.0,3.0
+87.0,3.0
+87.0,2.0
+108.0,2.0
+108.0,1.0
+138.0,1.0
+138.0,0.0
+2000.000002,0.0
+					</series>
+					<series title="" type="l" color="0xffff09" encoding="csv">0.0,5.0
+25.0,5.0
+25.0,4.0
+46.0,4.0
+46.0,3.0
+79.0,3.0
+79.0,2.0
+107.0,2.0
+107.0,1.0
+140.0,1.0
+140.0,0.0
+2000.000002,0.0
+					</series>
+					<series title="" type="l" color="0xffff0a" encoding="csv">0.0,5.0
+28.48798415879719,5.0
+28.48798415879719,4.0
+60.48798415879719,4.0
+60.48798415879719,3.0
+89.48798415879719,3.0
+89.48798415879719,2.0
+126.48798415879719,2.0
+126.48798415879719,1.0
+157.4879841587972,1.0
+157.4879841587972,0.0
+2000.000002,0.0
+					</series>
+					<series title="" type="l" color="0xffff0b" encoding="csv">0.0,5.0
+30.0,5.0
+30.0,4.0
+62.0,4.0
+62.0,3.0
+89.0,3.0
+89.0,2.0
+111.0,2.0
+111.0,1.0
+145.0,1.0
+145.0,0.0
+2000.000002,0.0
+					</series>
+					<series title="" type="l" color="0xffff0c" encoding="csv">0.0,5.0
+38.0,5.0
+38.0,4.0
+65.0,4.0
+65.0,3.0
+103.0,3.0
+103.0,2.0
+131.0,2.0
+131.0,1.0
+161.0,1.0
+161.0,0.0
+2000.000002,0.0
+					</series>
+					<series title="" type="l" color="0xffff0c" encoding="csv">0.0,5.0
+28.823533326853067,5.0
+28.823533326853067,4.0
+50.82353332685307,4.0
+50.82353332685307,3.0
+73.82353332685307,3.0
+73.82353332685307,2.0
+108.82353332685307,2.0
+108.82353332685307,1.0
+133.82353332685307,1.0
+133.82353332685307,0.0
+2000.000002,0.0
+					</series>
+					<series title="" type="l" color="0xffff0d" encoding="csv">0.0,5.0
+32.0,5.0
+32.0,4.0
+59.0,4.0
+59.0,3.0
+82.0,3.0
+82.0,2.0
+116.76556048658676,2.0
+116.76556048658676,1.0
+143.76556048658676,1.0
+143.76556048658676,0.0
+2000.000002,0.0
+					</series>
+					<series title="" type="l" color="0xffff0e" encoding="csv">0.0,5.0
+35.0,5.0
+35.0,4.0
+65.0,4.0
+65.0,3.0
+95.0,3.0
+95.0,2.0
+126.0,2.0
+126.0,1.0
+155.0,1.0
+155.0,0.0
+2000.000002,0.0
+					</series>
+					<series title="" type="l" color="0xffff0f" encoding="csv">0.0,5.0
+32.0,5.0
+32.0,4.0
+56.0,4.0
+56.0,3.0
+79.0,3.0
+79.0,2.0
+106.0,2.0
+106.0,1.0
+132.62883066060022,1.0
+132.62883066060022,0.0
+2000.000002,0.0
+					</series>
+					<series title="" type="l" color="0xffff10" encoding="csv">0.0,5.0
+34.0,5.0
+34.0,4.0
+63.0,4.0
+63.0,3.0
+99.0,3.0
+99.0,2.0
+138.0,2.0
+138.0,1.0
+163.0,1.0
+163.0,0.0
+2000.000002,0.0
+					</series>
+					<series title="" type="l" color="0xffff11" encoding="csv">0.0,5.0
+32.0,5.0
+32.0,4.0
+64.0,4.0
+64.0,3.0
+97.0,3.0
+97.0,2.0
+120.66059897578059,2.0
+120.66059897578059,1.0
+147.66059897578057,1.0
+147.66059897578057,0.0
+2000.000002,0.0
+					</series>
+					<series title="" type="l" color="0xffff12" encoding="csv">0.0,5.0
+26.0,5.0
+26.0,4.0
+47.0,4.0
+47.0,3.0
+73.0,3.0
+73.0,2.0
+98.0,2.0
+98.0,1.0
+121.0,1.0
+121.0,0.0
+2000.000002,0.0
+					</series>
+					<series title="" type="l" color="0xffff13" encoding="csv">0.0,5.0
+31.0,5.0
+31.0,4.0
+64.0,4.0
+64.0,3.0
+89.0,3.0
+89.0,2.0
+126.0,2.0
+126.0,1.0
+152.0,1.0
+152.0,0.0
+2000.000002,0.0
+					</series>
+					<series title="" type="l" color="0xffff14" encoding="csv">0.0,5.0
+32.0,5.0
+32.0,4.0
+58.0,4.0
+58.0,3.0
+80.0,3.0
+80.0,2.0
+104.0,2.0
+104.0,1.0
+142.0,1.0
+142.0,0.0
+2000.000002,0.0
+					</series>
+					<series title="" type="l" color="0xffff15" encoding="csv">0.0,5.0
+40.0,5.0
+40.0,4.0
+72.0,4.0
+72.0,3.0
+112.0,3.0
+112.0,2.0
+135.9120430597104,2.0
+135.9120430597104,1.0
+160.9120430597104,1.0
+160.9120430597104,0.0
+2000.000002,0.0
+					</series>
+					<series title="" type="l" color="0xffff15" encoding="csv">0.0,5.0
+30.0,5.0
+30.0,4.0
+60.0,4.0
+60.0,3.0
+93.0,3.0
+93.0,2.0
+119.0,2.0
+119.0,1.0
+141.0,1.0
+141.0,0.0
+2000.000002,0.0
+					</series>
+					<series title="" type="l" color="0xffff16" encoding="csv">0.0,5.0
+35.0,5.0
+35.0,4.0
+62.0,4.0
+62.0,3.0
+90.0,3.0
+90.0,2.0
+124.0,2.0
+124.0,1.0
+153.0,1.0
+153.0,0.0
+2000.000002,0.0
+					</series>
+					<series title="" type="l" color="0xffff17" encoding="csv">0.0,5.0
+23.0,5.0
+23.0,4.0
+45.0,4.0
+45.0,3.0
+76.0,3.0
+76.0,2.0
+102.0,2.0
+102.0,1.0
+135.0,1.0
+135.0,0.0
+2000.000002,0.0
+					</series>
+					<series title="" type="l" color="0xffff18" encoding="csv">0.0,5.0
+32.0,5.0
+32.0,4.0
+60.0,4.0
+60.0,3.0
+84.0,3.0
+84.0,2.0
+105.0,2.0
+105.0,1.0
+130.39418968558311,1.0
+130.39418968558311,0.0
+2000.000002,0.0
+					</series>
+					<series title="" type="l" color="0xffff19" encoding="csv">0.0,5.0
+27.0,5.0
+27.0,4.0
+48.0,4.0
+48.0,3.0
+73.0,3.0
+73.0,2.0
+99.0,2.0
+99.0,1.0
+131.0,1.0
+131.0,0.0
+2000.000002,0.0
+					</series>
+					<series title="" type="l" color="0xffff1a" encoding="csv">0.0,5.0
+25.0,5.0
+25.0,4.0
+59.0,4.0
+59.0,3.0
+83.0,3.0
+83.0,2.0
+106.0,2.0
+106.0,1.0
+136.0,1.0
+136.0,0.0
+2000.000002,0.0
+					</series>
+					<series title="" type="l" color="0xffff1b" encoding="csv">0.0,5.0
+25.0,5.0
+25.0,4.0
+48.0,4.0
+48.0,3.0
+70.0,3.0
+70.0,2.0
+99.0,2.0
+99.0,1.0
+130.0,1.0
+130.0,0.0
+2000.000002,0.0
+					</series>
+					<series title="" type="l" color="0xffff1c" encoding="csv">0.0,5.0
+30.0,5.0
+30.0,4.0
+60.0,4.0
+60.0,3.0
+91.0,3.0
+91.0,2.0
+121.0,2.0
+121.0,1.0
+150.37158974492922,1.0
+150.37158974492922,0.0
+2000.000002,0.0
+					</series>
+					<series title="" type="l" color="0xffff1d" encoding="csv">0.0,5.0
+31.0,5.0
+31.0,4.0
+61.0,4.0
+61.0,3.0
+101.0,3.0
+101.0,2.0
+140.0,2.0
+140.0,1.0
+174.0,1.0
+174.0,0.0
+2000.000002,0.0
+					</series>
+					<series title="" type="l" color="0xffff1d" encoding="csv">0.0,5.0
+38.0,5.0
+38.0,4.0
+67.28801236712509,4.0
+67.28801236712509,3.0
+95.28801236712508,3.0
+95.28801236712508,2.0
+126.28801236712508,2.0
+126.28801236712508,1.0
+153.28801236712508,1.0
+153.28801236712508,0.0
+2000.000002,0.0
+					</series>
+					<series title="" type="l" color="0xffff1e" encoding="csv">0.0,5.0
+23.0,5.0
+23.0,4.0
+45.0,4.0
+45.0,3.0
+70.0,3.0
+70.0,2.0
+94.0,2.0
+94.0,1.0
+119.0,1.0
+119.0,0.0
+2000.000002,0.0
+					</series>
+					<series title="" type="l" color="0xffff1f" encoding="csv">0.0,5.0
+23.0,5.0
+23.0,4.0
+45.0,4.0
+45.0,3.0
+70.0,3.0
+70.0,2.0
+97.0,2.0
+97.0,1.0
+138.0,1.0
+138.0,0.0
+2000.000002,0.0
+					</series>
+					<series title="" type="l" color="0xffff20" encoding="csv">0.0,5.0
+32.0,5.0
+32.0,4.0
+70.0,4.0
+70.0,3.0
+98.0,3.0
+98.0,2.0
+128.0,2.0
+128.0,1.0
+158.0,1.0
+158.0,0.0
+2000.000002,0.0
+					</series>
+					<series title="" type="l" color="0xffff21" encoding="csv">0.0,5.0
+25.0,5.0
+25.0,4.0
+46.0,4.0
+46.0,3.0
+72.0,3.0
+72.0,2.0
+107.0,2.0
+107.0,1.0
+150.0,1.0
+150.0,0.0
+2000.000002,0.0
+					</series>
+					<series title="" type="l" color="0xffff22" encoding="csv">0.0,5.0
+32.0,5.0
+32.0,4.0
+66.0,4.0
+66.0,3.0
+93.0,3.0
+93.0,2.0
+145.0,2.0
+145.0,1.0
+166.0,1.0
+166.0,0.0
+2000.000002,0.0
+					</series>
+					<series title="" type="l" color="0xffff23" encoding="csv">0.0,5.0
+23.0,5.0
+23.0,4.0
+62.0,4.0
+62.0,3.0
+90.0,3.0
+90.0,2.0
+115.0,2.0
+115.0,1.0
+150.0,1.0
+150.0,0.0
+2000.000002,0.0
+					</series>
+					<series title="" type="l" color="0xffff24" encoding="csv">0.0,5.0
+23.0,5.0
+23.0,4.0
+49.0,4.0
+49.0,3.0
+71.0,3.0
+71.0,2.0
+98.0,2.0
+98.0,1.0
+135.0,1.0
+135.0,0.0
+2000.000002,0.0
+					</series>
+					<series title="" type="l" color="0xffff25" encoding="csv">0.0,5.0
+29.0,5.0
+29.0,4.0
+55.0,4.0
+55.0,3.0
+80.0,3.0
+80.0,2.0
+104.0,2.0
+104.0,1.0
+129.4930173973553,1.0
+129.4930173973553,0.0
+2000.000002,0.0
+					</series>
+					<series title="" type="l" color="0xffff25" encoding="csv">0.0,5.0
+23.0,5.0
+23.0,4.0
+53.0,4.0
+53.0,3.0
+76.0,3.0
+76.0,2.0
+99.0,2.0
+99.0,1.0
+130.63426512293518,1.0
+130.63426512293518,0.0
+2000.000002,0.0
+					</series>
+					<series title="" type="l" color="0xffff26" encoding="csv">0.0,5.0
+26.0,5.0
+26.0,4.0
+48.166177534731105,4.0
+48.166177534731105,3.0
+86.08388283827192,3.0
+86.08388283827192,2.0
+107.08388283827192,2.0
+107.08388283827192,1.0
+130.0838828382719,1.0
+130.0838828382719,0.0
+2000.000002,0.0
+					</series>
+					<series title="" type="l" color="0xffff27" encoding="csv">0.0,5.0
+23.0,5.0
+23.0,4.0
+45.0,4.0
+45.0,3.0
+70.0,3.0
+70.0,2.0
+98.0,2.0
+98.0,1.0
+135.0,1.0
+135.0,0.0
+2000.000002,0.0
+					</series>
+					<series title="" type="l" color="0xffff28" encoding="csv">0.0,5.0
+32.0,5.0
+32.0,4.0
+58.0,4.0
+58.0,3.0
+81.0,3.0
+81.0,2.0
+103.0,2.0
+103.0,1.0
+129.0,1.0
+129.0,0.0
+2000.000002,0.0
+					</series>
+					<series title="" type="l" color="0xffff29" encoding="csv">0.0,5.0
+32.0,5.0
+32.0,4.0
+70.0,4.0
+70.0,3.0
+98.0,3.0
+98.0,2.0
+133.0,2.0
+133.0,1.0
+164.0,1.0
+164.0,0.0
+2000.000002,0.0
+					</series>
+					<series title="" type="l" color="0xffff2a" encoding="csv">0.0,5.0
+28.0,5.0
+28.0,4.0
+62.0,4.0
+62.0,3.0
+89.0,3.0
+89.0,2.0
+121.0,2.0
+121.0,1.0
+161.0,1.0
+161.0,0.0
+2000.000002,0.0
+					</series>
+					<series title="" type="l" color="0xffff2b" encoding="csv">0.0,5.0
+32.0,5.0
+32.0,4.0
+70.0,4.0
+70.0,3.0
+99.0,3.0
+99.0,2.0
+131.0,2.0
+131.0,1.0
+167.0,1.0
+167.0,0.0
+2000.000002,0.0
+					</series>
+					<series title="" type="l" color="0xffff2c" encoding="csv">0.0,5.0
+26.0,5.0
+26.0,4.0
+50.0,4.0
+50.0,3.0
+76.0,3.0
+76.0,2.0
+99.0,2.0
+99.0,1.0
+122.0,1.0
+122.0,0.0
+2000.000002,0.0
+					</series>
+					<series title="" type="l" color="0xffff2d" encoding="csv">0.0,5.0
+33.0,5.0
+33.0,4.0
+76.0,4.0
+76.0,3.0
+104.0,3.0
+104.0,2.0
+141.0,2.0
+141.0,1.0
+171.0,1.0
+171.0,0.0
+2000.000002,0.0
+					</series>
+					<series title="" type="l" color="0xffff2e" encoding="csv">0.0,5.0
+38.0,5.0
+38.0,4.0
+65.3173251899425,4.0
+65.3173251899425,3.0
+88.3173251899425,3.0
+88.3173251899425,2.0
+110.3173251899425,2.0
+110.3173251899425,1.0
+139.3173251899425,1.0
+139.3173251899425,0.0
+2000.000002,0.0
+					</series>
+					<series title="" type="l" color="0xffff2e" encoding="csv">0.0,5.0
+23.0,5.0
+23.0,4.0
+48.933679160429165,4.0
+48.933679160429165,3.0
+74.93367916042916,3.0
+74.93367916042916,2.0
+103.93367916042916,2.0
+103.93367916042916,1.0
+130.93367916042916,1.0
+130.93367916042916,0.0
+2000.000002,0.0
+					</series>
+					<series title="" type="l" color="0xffff2f" encoding="csv">0.0,5.0
+31.0,5.0
+31.0,4.0
+66.0,4.0
+66.0,3.0
+96.0,3.0
+96.0,2.0
+122.0,2.0
+122.0,1.0
+146.0,1.0
+146.0,0.0
+2000.000002,0.0
+					</series>
+					<series title="" type="l" color="0xffff30" encoding="csv">0.0,5.0
+25.0,5.0
+25.0,4.0
+49.0,4.0
+49.0,3.0
+72.0,3.0
+72.0,2.0
+95.99201365746558,2.0
+95.99201365746558,1.0
+132.99201365746558,1.0
+132.99201365746558,0.0
+2000.000002,0.0
+					</series>
+					<series title="" type="l" color="0xffff31" encoding="csv">0.0,5.0
+25.0,5.0
+25.0,4.0
+55.0,4.0
+55.0,3.0
+83.0,3.0
+83.0,2.0
+105.0,2.0
+105.0,1.0
+129.0,1.0
+129.0,0.0
+2000.000002,0.0
+					</series>
+					<series title="" type="l" color="0xffff32" encoding="csv">0.0,5.0
+27.0,5.0
+27.0,4.0
+48.0,4.0
+48.0,3.0
+75.86952450045219,3.0
+75.86952450045219,2.0
+117.86952450045219,2.0
+117.86952450045219,1.0
+140.8695245004522,1.0
+140.8695245004522,0.0
+2000.000002,0.0
+					</series>
+					<series title="" type="l" color="0xffff33" encoding="csv">0.0,5.0
+29.0,5.0
+29.0,4.0
+51.0,4.0
+51.0,3.0
+91.0,3.0
+91.0,2.0
+118.0,2.0
+118.0,1.0
+150.0,1.0
+150.0,0.0
+2000.000002,0.0
+					</series>
+					<series title="" type="l" color="0xffff34" encoding="csv">0.0,5.0
+38.0,5.0
+38.0,4.0
+63.0,4.0
+63.0,3.0
+88.0,3.0
+88.0,2.0
+110.0,2.0
+110.0,1.0
+137.0,1.0
+137.0,0.0
+2000.000002,0.0
+					</series>
+					<series title="" type="l" color="0xffff35" encoding="csv">0.0,5.0
+27.0,5.0
+27.0,4.0
+50.0,4.0
+50.0,3.0
+72.0,3.0
+72.0,2.0
+95.0,2.0
+95.0,1.0
+125.0,1.0
+125.0,0.0
+2000.000002,0.0
+					</series>
+					<series title="" type="l" color="0xffff36" encoding="csv">0.0,5.0
+28.0,5.0
+28.0,4.0
+65.0,4.0
+65.0,3.0
+95.0,3.0
+95.0,2.0
+131.0,2.0
+131.0,1.0
+168.8955966577769,1.0
+168.8955966577769,0.0
+2000.000002,0.0
+					</series>
+					<series title="" type="l" color="0xffff36" encoding="csv">0.0,5.0
+23.0,5.0
+23.0,4.0
+50.0,4.0
+50.0,3.0
+75.96852066135034,3.0
+75.96852066135034,2.0
+108.96852066135034,2.0
+108.96852066135034,1.0
+131.96852066135034,1.0
+131.96852066135034,0.0
+2000.000002,0.0
+					</series>
+					<series title="" type="l" color="0xffff37" encoding="csv">0.0,5.0
+23.0,5.0
+23.0,4.0
+46.0,4.0
+46.0,3.0
+69.48200483131222,3.0
+69.48200483131222,2.0
+102.48200483131222,2.0
+102.48200483131222,1.0
+130.48200483131222,1.0
+130.48200483131222,0.0
+2000.000002,0.0
+					</series>
+					<series title="" type="l" color="0xffff38" encoding="csv">0.0,5.0
+27.0,5.0
+27.0,4.0
+48.0,4.0
+48.0,3.0
+75.0,3.0
+75.0,2.0
+112.0,2.0
+112.0,1.0
+138.0,1.0
+138.0,0.0
+2000.000002,0.0
+					</series>
+					<series title="" type="l" color="0xffff39" encoding="csv">0.0,5.0
+30.0,5.0
+30.0,4.0
+67.0,4.0
+67.0,3.0
+98.0,3.0
+98.0,2.0
+134.0,2.0
+134.0,1.0
+164.0,1.0
+164.0,0.0
+2000.000002,0.0
+					</series>
+					<series title="" type="l" color="0xffff3a" encoding="csv">0.0,5.0
+33.0,5.0
+33.0,4.0
+60.9284834548351,4.0
+60.9284834548351,3.0
+83.92848345483509,3.0
+83.92848345483509,2.0
+105.58743756269237,2.0
+105.58743756269237,1.0
+135.58743756269237,1.0
+135.58743756269237,0.0
+2000.000002,0.0
+					</series>
+					<series title="" type="l" color="0xffff3b" encoding="csv">0.0,5.0
+23.0,5.0
+23.0,4.0
+45.0,4.0
+45.0,3.0
+72.0,3.0
+72.0,2.0
+109.0,2.0
+109.0,1.0
+139.0,1.0
+139.0,0.0
+2000.000002,0.0
+					</series>
+					<series title="" type="l" color="0xffff3c" encoding="csv">0.0,5.0
+23.0,5.0
+23.0,4.0
+46.0,4.0
+46.0,3.0
+69.0,3.0
+69.0,2.0
+108.0,2.0
+108.0,1.0
+131.0,1.0
+131.0,0.0
+2000.000002,0.0
+					</series>
+					<series title="" type="l" color="0xffff3d" encoding="csv">0.0,5.0
+25.0,5.0
+25.0,4.0
+46.0,4.0
+46.0,3.0
+70.0,3.0
+70.0,2.0
+94.0,2.0
+94.0,1.0
+131.0,1.0
+131.0,0.0
+2000.000002,0.0
+					</series>
+					<series title="" type="l" color="0xffff3e" encoding="csv">0.0,5.0
+23.0,5.0
+23.0,4.0
+45.0,4.0
+45.0,3.0
+74.0,3.0
+74.0,2.0
+97.0,2.0
+97.0,1.0
+131.0,1.0
+131.0,0.0
+2000.000002,0.0
+					</series>
+					<series title="" type="l" color="0xffff3e" encoding="csv">0.0,5.0
+28.0,5.0
+28.0,4.0
+50.0,4.0
+50.0,3.0
+80.77137078040217,3.0
+80.77137078040217,2.0
+102.77137078040217,2.0
+102.77137078040217,1.0
+132.77137078040215,1.0
+132.77137078040215,0.0
+2000.000002,0.0
+					</series>
+					<series title="" type="l" color="0xffff3f" encoding="csv">0.0,5.0
+25.0,5.0
+25.0,4.0
+46.0,4.0
+46.0,3.0
+89.0,3.0
+89.0,2.0
+133.0,2.0
+133.0,1.0
+157.0,1.0
+157.0,0.0
+2000.000002,0.0
+					</series>
+					<series title="" type="l" color="0xffff40" encoding="csv">0.0,5.0
+23.0,5.0
+23.0,4.0
+67.0,4.0
+67.0,3.0
+101.0,3.0
+101.0,2.0
+129.0,2.0
+129.0,1.0
+165.9821829868015,1.0
+165.9821829868015,0.0
+2000.000002,0.0
+					</series>
+					<series title="" type="l" color="0xffff41" encoding="csv">0.0,5.0
+27.0,5.0
+27.0,4.0
+62.0,4.0
+62.0,3.0
+85.0,3.0
+85.0,2.0
+121.0,2.0
+121.0,1.0
+163.0,1.0
+163.0,0.0
+2000.000002,0.0
+					</series>
+					<series title="" type="l" color="0xffff42" encoding="csv">0.0,5.0
+32.0,5.0
+32.0,4.0
+63.0,4.0
+63.0,3.0
+88.0,3.0
+88.0,2.0
+115.0,2.0
+115.0,1.0
+138.0,1.0
+138.0,0.0
+2000.000002,0.0
+					</series>
+					<series title="" type="l" color="0xffff43" encoding="csv">0.0,5.0
+35.0,5.0
+35.0,4.0
+66.0,4.0
+66.0,3.0
+94.0,3.0
+94.0,2.0
+127.0,2.0
+127.0,1.0
+166.0,1.0
+166.0,0.0
+2000.000002,0.0
+					</series>
+					<series title="" type="l" color="0xffff44" encoding="csv">0.0,5.0
+25.0,5.0
+25.0,4.0
+46.0,4.0
+46.0,3.0
+73.0,3.0
+73.0,2.0
+102.0,2.0
+102.0,1.0
+133.0,1.0
+133.0,0.0
+2000.000002,0.0
+					</series>
+					<series title="" type="l" color="0xffff45" encoding="csv">0.0,5.0
+30.0,5.0
+30.0,4.0
+62.0,4.0
+62.0,3.0
+88.0,3.0
+88.0,2.0
+118.0,2.0
+118.0,1.0
+140.0,1.0
+140.0,0.0
+2000.000002,0.0
+					</series>
+					<series title="" type="l" color="0xffff46" encoding="csv">0.0,5.0
+40.0,5.0
+40.0,4.0
+74.0,4.0
+74.0,3.0
+108.0,3.0
+108.0,2.0
+134.0,2.0
+134.0,1.0
+162.0,1.0
+162.0,0.0
+2000.000002,0.0
+					</series>
+					<series title="" type="l" color="0xffff47" encoding="csv">0.0,5.0
+47.0,5.0
+47.0,4.0
+70.0,4.0
+70.0,3.0
+94.0,3.0
+94.0,2.0
+122.0,2.0
+122.0,1.0
+156.0,1.0
+156.0,0.0
+2000.000002,0.0
+					</series>
+					<series title="" type="l" color="0xffff47" encoding="csv">0.0,5.0
+23.0,5.0
+23.0,4.0
+57.83605037400647,4.0
+57.83605037400647,3.0
+80.83605037400646,3.0
+80.83605037400646,2.0
+114.83605037400646,2.0
+114.83605037400646,1.0
+143.7874896397362,1.0
+143.7874896397362,0.0
+2000.000002,0.0
+					</series>
+					<series title="" type="l" color="0xffff48" encoding="csv">0.0,5.0
+30.0,5.0
+30.0,4.0
+56.0,4.0
+56.0,3.0
+77.0,3.0
+77.0,2.0
+106.0,2.0
+106.0,1.0
+139.0,1.0
+139.0,0.0
+2000.000002,0.0
+					</series>
+					<series title="" type="l" color="0xffff49" encoding="csv">0.0,5.0
+24.0,5.0
+24.0,4.0
+45.0,4.0
+45.0,3.0
+70.0,3.0
+70.0,2.0
+98.0,2.0
+98.0,1.0
+140.0,1.0
+140.0,0.0
+2000.000002,0.0
+					</series>
+					<series title="" type="l" color="0xffff4a" encoding="csv">0.0,5.0
+30.0,5.0
+30.0,4.0
+66.0,4.0
+66.0,3.0
+99.0,3.0
+99.0,2.0
+141.0,2.0
+141.0,1.0
+166.0,1.0
+166.0,0.0
+2000.000002,0.0
+					</series>
+					<series title="" type="l" color="0xffff4b" encoding="csv">0.0,5.0
+25.0,5.0
+25.0,4.0
+55.0,4.0
+55.0,3.0
+82.0,3.0
+82.0,2.0
+104.0,2.0
+104.0,1.0
+136.0,1.0
+136.0,0.0
+2000.000002,0.0
+					</series>
+					<series title="" type="l" color="0xffff4c" encoding="csv">0.0,5.0
+31.0,5.0
+31.0,4.0
+65.0,4.0
+65.0,3.0
+94.0,3.0
+94.0,2.0
+125.0,2.0
+125.0,1.0
+162.0,1.0
+162.0,0.0
+2000.000002,0.0
+					</series>
+					<series title="" type="l" color="0xffff4d" encoding="csv">0.0,5.0
+40.0,5.0
+40.0,4.0
+69.0,4.0
+69.0,3.0
+116.0,3.0
+116.0,2.0
+137.0,2.0
+137.0,1.0
+160.0,1.0
+160.0,0.0
+2000.000002,0.0
+					</series>
+					<series title="" type="l" color="0xffff4e" encoding="csv">0.0,5.0
+23.0,5.0
+23.0,4.0
+63.0,4.0
+63.0,3.0
+86.0,3.0
+86.0,2.0
+113.0,2.0
+113.0,1.0
+135.0,1.0
+135.0,0.0
+2000.000002,0.0
+					</series>
+					<series title="" type="l" color="0xffff4f" encoding="csv">0.0,5.0
+23.0,5.0
+23.0,4.0
+60.0,4.0
+60.0,3.0
+86.0,3.0
+86.0,2.0
+107.0,2.0
+107.0,1.0
+135.0,1.0
+135.0,0.0
+2000.000002,0.0
+					</series>
+					<series title="" type="l" color="0xffff4f" encoding="csv">0.0,5.0
+30.0,5.0
+30.0,4.0
+60.0,4.0
+60.0,3.0
+89.0,3.0
+89.0,2.0
+120.62412317004055,2.0
+120.62412317004055,1.0
+154.62412317004055,1.0
+154.62412317004055,0.0
+2000.000002,0.0
+					</series>
+					<series title="" type="l" color="0xffff50" encoding="csv">0.0,5.0
+30.0,5.0
+30.0,4.0
+62.0,4.0
+62.0,3.0
+86.0,3.0
+86.0,2.0
+118.0,2.0
+118.0,1.0
+140.0,1.0
+140.0,0.0
+2000.000002,0.0
+					</series>
+					<series title="" type="l" color="0xffff51" encoding="csv">0.0,5.0
+38.0,5.0
+38.0,4.0
+68.0,4.0
+68.0,3.0
+95.0,3.0
+95.0,2.0
+125.0,2.0
+125.0,1.0
+163.0,1.0
+163.0,0.0
+2000.000002,0.0
+					</series>
+					<series title="" type="l" color="0xffff52" encoding="csv">0.0,5.0
+28.970443525118753,5.0
+28.970443525118753,4.0
+50.97044352511875,4.0
+50.97044352511875,3.0
+72.97044352511875,3.0
+72.97044352511875,2.0
+95.97044352511875,2.0
+95.97044352511875,1.0
+120.97044352511875,1.0
+120.97044352511875,0.0
+2000.000002,0.0
+					</series>
+					<series title="" type="l" color="0xffff53" encoding="csv">0.0,5.0
+32.0,5.0
+32.0,4.0
+62.0,4.0
+62.0,3.0
+97.0,3.0
+97.0,2.0
+120.22558679222129,2.0
+120.22558679222129,1.0
+152.1369981775357,1.0
+152.1369981775357,0.0
+2000.000002,0.0
+					</series>
+					<series title="" type="l" color="0xffff54" encoding="csv">0.0,5.0
+29.0,5.0
+29.0,4.0
+63.0,4.0
+63.0,3.0
+88.0,3.0
+88.0,2.0
+112.0,2.0
+112.0,1.0
+145.91382543437146,1.0
+145.91382543437146,0.0
+2000.000002,0.0
+					</series>
+					<series title="" type="l" color="0xffff55" encoding="csv">0.0,5.0
+28.928528629010543,5.0
+28.928528629010543,4.0
+53.92852862901054,4.0
+53.92852862901054,3.0
+77.92852862901054,3.0
+77.92852862901054,2.0
+110.92852862901054,2.0
+110.92852862901054,1.0
+132.92852862901054,1.0
+132.92852862901054,0.0
+2000.000002,0.0
+					</series>
+					<series title="" type="l" color="0xffff56" encoding="csv">0.0,5.0
+23.0,5.0
+23.0,4.0
+45.0,4.0
+45.0,3.0
+75.0,3.0
+75.0,2.0
+101.0,2.0
+101.0,1.0
+133.0,1.0
+133.0,0.0
+2000.000002,0.0
+					</series>
+					<series title="" type="l" color="0xffff57" encoding="csv">0.0,5.0
+25.0,5.0
+25.0,4.0
+46.0,4.0
+46.0,3.0
+70.0,3.0
+70.0,2.0
+97.0,2.0
+97.0,1.0
+131.0,1.0
+131.0,0.0
+2000.000002,0.0
+					</series>
+					<series title="" type="l" color="0xffff57" encoding="csv">0.0,5.0
+26.0,5.0
+26.0,4.0
+47.0,4.0
+47.0,3.0
+70.0,3.0
+70.0,2.0
+98.0,2.0
+98.0,1.0
+126.0,1.0
+126.0,0.0
+2000.000002,0.0
+					</series>
+					<series title="" type="l" color="0xffff58" encoding="csv">0.0,5.0
+36.0,5.0
+36.0,4.0
+62.0,4.0
+62.0,3.0
+89.0,3.0
+89.0,2.0
+113.0,2.0
+113.0,1.0
+135.0,1.0
+135.0,0.0
+2000.000002,0.0
+					</series>
+					<series title="level" type="l" color="0x00ff00" encoding="csv">0.0,1.0
+2000.000002,1.0
+					</series>
+					<series title="" type="l" color="0x01ff01" encoding="csv">0.0,1.0
+2000.000002,1.0
+					</series>
+					<series title="" type="l" color="0x02ff02" encoding="csv">0.0,1.0
+2000.000002,1.0
+					</series>
+					<series title="" type="l" color="0x03ff03" encoding="csv">0.0,1.0
+2000.000002,1.0
+					</series>
+					<series title="" type="l" color="0x04ff04" encoding="csv">0.0,1.0
+2000.000002,1.0
+					</series>
+					<series title="" type="l" color="0x04ff04" encoding="csv">0.0,1.0
+2000.000002,1.0
+					</series>
+					<series title="" type="l" color="0x05ff05" encoding="csv">0.0,1.0
+2000.000002,1.0
+					</series>
+					<series title="" type="l" color="0x06ff06" encoding="csv">0.0,1.0
+2000.000002,1.0
+					</series>
+					<series title="" type="l" color="0x07ff07" encoding="csv">0.0,1.0
+2000.000002,1.0
+					</series>
+					<series title="" type="l" color="0x08ff08" encoding="csv">0.0,1.0
+2000.000002,1.0
+					</series>
+					<series title="" type="l" color="0x09ff09" encoding="csv">0.0,1.0
+2000.000002,1.0
+					</series>
+					<series title="" type="l" color="0x0aff0a" encoding="csv">0.0,1.0
+2000.000002,1.0
+					</series>
+					<series title="" type="l" color="0x0bff0b" encoding="csv">0.0,1.0
+2000.000002,1.0
+					</series>
+					<series title="" type="l" color="0x0cff0c" encoding="csv">0.0,1.0
+2000.000002,1.0
+					</series>
+					<series title="" type="l" color="0x0cff0c" encoding="csv">0.0,1.0
+2000.000002,1.0
+					</series>
+					<series title="" type="l" color="0x0dff0d" encoding="csv">0.0,1.0
+2000.000002,1.0
+					</series>
+					<series title="" type="l" color="0x0eff0e" encoding="csv">0.0,1.0
+2000.000002,1.0
+					</series>
+					<series title="" type="l" color="0x0fff0f" encoding="csv">0.0,1.0
+2000.000002,1.0
+					</series>
+					<series title="" type="l" color="0x10ff10" encoding="csv">0.0,1.0
+2000.000002,1.0
+					</series>
+					<series title="" type="l" color="0x11ff11" encoding="csv">0.0,1.0
+2000.000002,1.0
+					</series>
+					<series title="" type="l" color="0x12ff12" encoding="csv">0.0,1.0
+2000.000002,1.0
+					</series>
+					<series title="" type="l" color="0x13ff13" encoding="csv">0.0,1.0
+2000.000002,1.0
+					</series>
+					<series title="" type="l" color="0x14ff14" encoding="csv">0.0,1.0
+2000.000002,1.0
+					</series>
+					<series title="" type="l" color="0x15ff15" encoding="csv">0.0,1.0
+2000.000002,1.0
+					</series>
+					<series title="" type="l" color="0x15ff15" encoding="csv">0.0,1.0
+2000.000002,1.0
+					</series>
+					<series title="" type="l" color="0x16ff16" encoding="csv">0.0,1.0
+2000.000002,1.0
+					</series>
+					<series title="" type="l" color="0x17ff17" encoding="csv">0.0,1.0
+2000.000002,1.0
+					</series>
+					<series title="" type="l" color="0x18ff18" encoding="csv">0.0,1.0
+2000.000002,1.0
+					</series>
+					<series title="" type="l" color="0x19ff19" encoding="csv">0.0,1.0
+2000.000002,1.0
+					</series>
+					<series title="" type="l" color="0x1aff1a" encoding="csv">0.0,1.0
+2000.000002,1.0
+					</series>
+					<series title="" type="l" color="0x1bff1b" encoding="csv">0.0,1.0
+2000.000002,1.0
+					</series>
+					<series title="" type="l" color="0x1cff1c" encoding="csv">0.0,1.0
+2000.000002,1.0
+					</series>
+					<series title="" type="l" color="0x1dff1d" encoding="csv">0.0,1.0
+2000.000002,1.0
+					</series>
+					<series title="" type="l" color="0x1dff1d" encoding="csv">0.0,1.0
+2000.000002,1.0
+					</series>
+					<series title="" type="l" color="0x1eff1e" encoding="csv">0.0,1.0
+2000.000002,1.0
+					</series>
+					<series title="" type="l" color="0x1fff1f" encoding="csv">0.0,1.0
+2000.000002,1.0
+					</series>
+					<series title="" type="l" color="0x20ff20" encoding="csv">0.0,1.0
+2000.000002,1.0
+					</series>
+					<series title="" type="l" color="0x21ff21" encoding="csv">0.0,1.0
+2000.000002,1.0
+					</series>
+					<series title="" type="l" color="0x22ff22" encoding="csv">0.0,1.0
+2000.000002,1.0
+					</series>
+					<series title="" type="l" color="0x23ff23" encoding="csv">0.0,1.0
+2000.000002,1.0
+					</series>
+					<series title="" type="l" color="0x24ff24" encoding="csv">0.0,1.0
+2000.000002,1.0
+					</series>
+					<series title="" type="l" color="0x25ff25" encoding="csv">0.0,1.0
+2000.000002,1.0
+					</series>
+					<series title="" type="l" color="0x25ff25" encoding="csv">0.0,1.0
+2000.000002,1.0
+					</series>
+					<series title="" type="l" color="0x26ff26" encoding="csv">0.0,1.0
+2000.000002,1.0
+					</series>
+					<series title="" type="l" color="0x27ff27" encoding="csv">0.0,1.0
+2000.000002,1.0
+					</series>
+					<series title="" type="l" color="0x28ff28" encoding="csv">0.0,1.0
+2000.000002,1.0
+					</series>
+					<series title="" type="l" color="0x29ff29" encoding="csv">0.0,1.0
+2000.000002,1.0
+					</series>
+					<series title="" type="l" color="0x2aff2a" encoding="csv">0.0,1.0
+2000.000002,1.0
+					</series>
+					<series title="" type="l" color="0x2bff2b" encoding="csv">0.0,1.0
+2000.000002,1.0
+					</series>
+					<series title="" type="l" color="0x2cff2c" encoding="csv">0.0,1.0
+2000.000002,1.0
+					</series>
+					<series title="" type="l" color="0x2dff2d" encoding="csv">0.0,1.0
+2000.000002,1.0
+					</series>
+					<series title="" type="l" color="0x2eff2e" encoding="csv">0.0,1.0
+2000.000002,1.0
+					</series>
+					<series title="" type="l" color="0x2eff2e" encoding="csv">0.0,1.0
+2000.000002,1.0
+					</series>
+					<series title="" type="l" color="0x2fff2f" encoding="csv">0.0,1.0
+2000.000002,1.0
+					</series>
+					<series title="" type="l" color="0x30ff30" encoding="csv">0.0,1.0
+2000.000002,1.0
+					</series>
+					<series title="" type="l" color="0x31ff31" encoding="csv">0.0,1.0
+2000.000002,1.0
+					</series>
+					<series title="" type="l" color="0x32ff32" encoding="csv">0.0,1.0
+2000.000002,1.0
+					</series>
+					<series title="" type="l" color="0x33ff33" encoding="csv">0.0,1.0
+2000.000002,1.0
+					</series>
+					<series title="" type="l" color="0x34ff34" encoding="csv">0.0,1.0
+2000.000002,1.0
+					</series>
+					<series title="" type="l" color="0x35ff35" encoding="csv">0.0,1.0
+2000.000002,1.0
+					</series>
+					<series title="" type="l" color="0x36ff36" encoding="csv">0.0,1.0
+2000.000002,1.0
+					</series>
+					<series title="" type="l" color="0x36ff36" encoding="csv">0.0,1.0
+2000.000002,1.0
+					</series>
+					<series title="" type="l" color="0x37ff37" encoding="csv">0.0,1.0
+2000.000002,1.0
+					</series>
+					<series title="" type="l" color="0x38ff38" encoding="csv">0.0,1.0
+2000.000002,1.0
+					</series>
+					<series title="" type="l" color="0x39ff39" encoding="csv">0.0,1.0
+2000.000002,1.0
+					</series>
+					<series title="" type="l" color="0x3aff3a" encoding="csv">0.0,1.0
+2000.000002,1.0
+					</series>
+					<series title="" type="l" color="0x3bff3b" encoding="csv">0.0,1.0
+2000.000002,1.0
+					</series>
+					<series title="" type="l" color="0x3cff3c" encoding="csv">0.0,1.0
+2000.000002,1.0
+					</series>
+					<series title="" type="l" color="0x3dff3d" encoding="csv">0.0,1.0
+2000.000002,1.0
+					</series>
+					<series title="" type="l" color="0x3eff3e" encoding="csv">0.0,1.0
+2000.000002,1.0
+					</series>
+					<series title="" type="l" color="0x3eff3e" encoding="csv">0.0,1.0
+2000.000002,1.0
+					</series>
+					<series title="" type="l" color="0x3fff3f" encoding="csv">0.0,1.0
+2000.000002,1.0
+					</series>
+					<series title="" type="l" color="0x40ff40" encoding="csv">0.0,1.0
+2000.000002,1.0
+					</series>
+					<series title="" type="l" color="0x41ff41" encoding="csv">0.0,1.0
+2000.000002,1.0
+					</series>
+					<series title="" type="l" color="0x42ff42" encoding="csv">0.0,1.0
+2000.000002,1.0
+					</series>
+					<series title="" type="l" color="0x43ff43" encoding="csv">0.0,1.0
+2000.000002,1.0
+					</series>
+					<series title="" type="l" color="0x44ff44" encoding="csv">0.0,1.0
+2000.000002,1.0
+					</series>
+					<series title="" type="l" color="0x45ff45" encoding="csv">0.0,1.0
+2000.000002,1.0
+					</series>
+					<series title="" type="l" color="0x46ff46" encoding="csv">0.0,1.0
+2000.000002,1.0
+					</series>
+					<series title="" type="l" color="0x47ff47" encoding="csv">0.0,1.0
+2000.000002,1.0
+					</series>
+					<series title="" type="l" color="0x47ff47" encoding="csv">0.0,1.0
+2000.000002,1.0
+					</series>
+					<series title="" type="l" color="0x48ff48" encoding="csv">0.0,1.0
+2000.000002,1.0
+					</series>
+					<series title="" type="l" color="0x49ff49" encoding="csv">0.0,1.0
+2000.000002,1.0
+					</series>
+					<series title="" type="l" color="0x4aff4a" encoding="csv">0.0,1.0
+2000.000002,1.0
+					</series>
+					<series title="" type="l" color="0x4bff4b" encoding="csv">0.0,1.0
+2000.000002,1.0
+					</series>
+					<series title="" type="l" color="0x4cff4c" encoding="csv">0.0,1.0
+2000.000002,1.0
+					</series>
+					<series title="" type="l" color="0x4dff4d" encoding="csv">0.0,1.0
+2000.000002,1.0
+					</series>
+					<series title="" type="l" color="0x4eff4e" encoding="csv">0.0,1.0
+2000.000002,1.0
+					</series>
+					<series title="" type="l" color="0x4fff4f" encoding="csv">0.0,1.0
+2000.000002,1.0
+					</series>
+					<series title="" type="l" color="0x4fff4f" encoding="csv">0.0,1.0
+2000.000002,1.0
+					</series>
+					<series title="" type="l" color="0x50ff50" encoding="csv">0.0,1.0
+2000.000002,1.0
+					</series>
+					<series title="" type="l" color="0x51ff51" encoding="csv">0.0,1.0
+2000.000002,1.0
+					</series>
+					<series title="" type="l" color="0x52ff52" encoding="csv">0.0,1.0
+2000.000002,1.0
+					</series>
+					<series title="" type="l" color="0x53ff53" encoding="csv">0.0,1.0
+2000.000002,1.0
+					</series>
+					<series title="" type="l" color="0x54ff54" encoding="csv">0.0,1.0
+2000.000002,1.0
+					</series>
+					<series title="" type="l" color="0x55ff55" encoding="csv">0.0,1.0
+2000.000002,1.0
+					</series>
+					<series title="" type="l" color="0x56ff56" encoding="csv">0.0,1.0
+2000.000002,1.0
+					</series>
+					<series title="" type="l" color="0x57ff57" encoding="csv">0.0,1.0
+2000.000002,1.0
+					</series>
+					<series title="" type="l" color="0x57ff57" encoding="csv">0.0,1.0
+2000.000002,1.0
+					</series>
+					<series title="" type="l" color="0x58ff58" encoding="csv">0.0,1.0
+2000.000002,1.0
+					</series>
+					<series title="deaths_by_car" type="l" color="0x00ffff" encoding="csv">0.0,0.0
+25.0,0.0
+25.0,1.0
+47.0,1.0
+47.0,2.0
+71.0,2.0
+71.0,3.0
+96.0,3.0
+96.0,4.0
+2000.000002,4.0
+					</series>
+					<series title="" type="l" color="0x01ffff" encoding="csv">0.0,0.0
+36.0,0.0
+36.0,1.0
+101.0,1.0
+101.0,2.0
+130.0,2.0
+130.0,3.0
+165.0,3.0
+165.0,4.0
+2000.000002,4.0
+					</series>
+					<series title="" type="l" color="0x02ffff" encoding="csv">0.0,0.0
+25.0,0.0
+25.0,1.0
+46.0,1.0
+46.0,2.0
+70.0,2.0
+70.0,3.0
+126.0,3.0
+126.0,4.0
+2000.000002,4.0
+					</series>
+					<series title="" type="l" color="0x03ffff" encoding="csv">0.0,0.0
+100.0,0.0
+100.0,1.0
+130.0,1.0
+130.0,2.0
+157.0,2.0
+157.0,3.0
+2000.000002,3.0
+					</series>
+					<series title="" type="l" color="0x04ffff" encoding="csv">0.0,0.0
+27.0,0.0
+27.0,1.0
+48.0,1.0
+48.0,2.0
+74.0,2.0
+74.0,3.0
+100.0,3.0
+100.0,4.0
+2000.000002,4.0
+					</series>
+					<series title="" type="l" color="0x04ffff" encoding="csv">0.0,0.0
+23.0,0.0
+23.0,1.0
+45.542637600330636,1.0
+45.542637600330636,2.0
+108.54263760033064,2.0
+108.54263760033064,3.0
+138.54263760033064,3.0
+138.54263760033064,4.0
+2000.000002,4.0
+					</series>
+					<series title="" type="l" color="0x05ffff" encoding="csv">0.0,0.0
+25.0,0.0
+25.0,1.0
+46.0,1.0
+46.0,2.0
+69.0,2.0
+69.0,3.0
+93.0,3.0
+93.0,4.0
+120.4408119651489,4.0
+120.4408119651489,5.0
+2000.000002,5.0
+					</series>
+					<series title="" type="l" color="0x06ffff" encoding="csv">0.0,0.0
+23.0,0.0
+23.0,1.0
+83.0,1.0
+83.0,2.0
+108.0,2.0
+108.0,3.0
+140.0,3.0
+140.0,4.0
+2000.000002,4.0
+					</series>
+					<series title="" type="l" color="0x07ffff" encoding="csv">0.0,0.0
+31.0,0.0
+31.0,1.0
+88.0,1.0
+88.0,2.0
+110.0,2.0
+110.0,3.0
+132.0,3.0
+132.0,4.0
+2000.000002,4.0
+					</series>
+					<series title="" type="l" color="0x08ffff" encoding="csv">0.0,0.0
+30.0,0.0
+30.0,1.0
+87.0,1.0
+87.0,2.0
+108.0,2.0
+108.0,3.0
+2000.000002,3.0
+					</series>
+					<series title="" type="l" color="0x09ffff" encoding="csv">0.0,0.0
+25.0,0.0
+25.0,1.0
+46.0,1.0
+46.0,2.0
+107.0,2.0
+107.0,3.0
+2000.000002,3.0
+					</series>
+					<series title="" type="l" color="0x0affff" encoding="csv">0.0,0.0
+28.48798415879719,0.0
+28.48798415879719,1.0
+89.48798415879719,1.0
+89.48798415879719,2.0
+157.4879841587972,2.0
+157.4879841587972,3.0
+2000.000002,3.0
+					</series>
+					<series title="" type="l" color="0x0bffff" encoding="csv">0.0,0.0
+30.0,0.0
+30.0,1.0
+89.0,1.0
+89.0,2.0
+111.0,2.0
+111.0,3.0
+2000.000002,3.0
+					</series>
+					<series title="" type="l" color="0x0cffff" encoding="csv">0.0,0.0
+65.0,0.0
+65.0,1.0
+103.0,1.0
+103.0,2.0
+161.0,2.0
+161.0,3.0
+2000.000002,3.0
+					</series>
+					<series title="" type="l" color="0x0cffff" encoding="csv">0.0,0.0
+28.823533326853067,0.0
+28.823533326853067,1.0
+50.82353332685307,1.0
+50.82353332685307,2.0
+73.82353332685307,2.0
+73.82353332685307,3.0
+133.82353332685307,3.0
+133.82353332685307,4.0
+2000.000002,4.0
+					</series>
+					<series title="" type="l" color="0x0dffff" encoding="csv">0.0,0.0
+32.0,0.0
+32.0,1.0
+59.0,1.0
+59.0,2.0
+82.0,2.0
+82.0,3.0
+116.76556048658676,3.0
+116.76556048658676,4.0
+143.76556048658676,4.0
+143.76556048658676,5.0
+2000.000002,5.0
+					</series>
+					<series title="" type="l" color="0x0effff" encoding="csv">0.0,0.0
+35.0,0.0
+35.0,1.0
+126.0,1.0
+126.0,2.0
+155.0,2.0
+155.0,3.0
+2000.000002,3.0
+					</series>
+					<series title="" type="l" color="0x0fffff" encoding="csv">0.0,0.0
+32.0,0.0
+32.0,1.0
+56.0,1.0
+56.0,2.0
+79.0,2.0
+79.0,3.0
+106.0,3.0
+106.0,4.0
+132.62883066060022,4.0
+132.62883066060022,5.0
+2000.000002,5.0
+					</series>
+					<series title="" type="l" color="0x10ffff" encoding="csv">0.0,0.0
+34.0,0.0
+34.0,1.0
+163.0,1.0
+163.0,2.0
+2000.000002,2.0
+					</series>
+					<series title="" type="l" color="0x11ffff" encoding="csv">0.0,0.0
+97.0,0.0
+97.0,1.0
+120.66059897578059,1.0
+120.66059897578059,2.0
+147.66059897578057,2.0
+147.66059897578057,3.0
+2000.000002,3.0
+					</series>
+					<series title="" type="l" color="0x12ffff" encoding="csv">0.0,0.0
+26.0,0.0
+26.0,1.0
+47.0,1.0
+47.0,2.0
+73.0,2.0
+73.0,3.0
+98.0,3.0
+98.0,4.0
+121.0,4.0
+121.0,5.0
+2000.000002,5.0
+					</series>
+					<series title="" type="l" color="0x13ffff" encoding="csv">0.0,0.0
+31.0,0.0
+31.0,1.0
+89.0,1.0
+89.0,2.0
+152.0,2.0
+152.0,3.0
+2000.000002,3.0
+					</series>
+					<series title="" type="l" color="0x14ffff" encoding="csv">0.0,0.0
+32.0,0.0
+32.0,1.0
+58.0,1.0
+58.0,2.0
+80.0,2.0
+80.0,3.0
+104.0,3.0
+104.0,4.0
+2000.000002,4.0
+					</series>
+					<series title="" type="l" color="0x15ffff" encoding="csv">0.0,0.0
+40.0,0.0
+40.0,1.0
+72.0,1.0
+72.0,2.0
+135.9120430597104,2.0
+135.9120430597104,3.0
+160.9120430597104,3.0
+160.9120430597104,4.0
+2000.000002,4.0
+					</series>
+					<series title="" type="l" color="0x15ffff" encoding="csv">0.0,0.0
+30.0,0.0
+30.0,1.0
+119.0,1.0
+119.0,2.0
+141.0,2.0
+141.0,3.0
+2000.000002,3.0
+					</series>
+					<series title="" type="l" color="0x16ffff" encoding="csv">0.0,0.0
+35.0,0.0
+35.0,1.0
+62.0,1.0
+62.0,2.0
+90.0,2.0
+90.0,3.0
+124.0,3.0
+124.0,4.0
+153.0,4.0
+153.0,5.0
+2000.000002,5.0
+					</series>
+					<series title="" type="l" color="0x17ffff" encoding="csv">0.0,0.0
+23.0,0.0
+23.0,1.0
+45.0,1.0
+45.0,2.0
+102.0,2.0
+102.0,3.0
+135.0,3.0
+135.0,4.0
+2000.000002,4.0
+					</series>
+					<series title="" type="l" color="0x18ffff" encoding="csv">0.0,0.0
+32.0,0.0
+32.0,1.0
+60.0,1.0
+60.0,2.0
+84.0,2.0
+84.0,3.0
+105.0,3.0
+105.0,4.0
+130.39418968558311,4.0
+130.39418968558311,5.0
+2000.000002,5.0
+					</series>
+					<series title="" type="l" color="0x19ffff" encoding="csv">0.0,0.0
+27.0,0.0
+27.0,1.0
+48.0,1.0
+48.0,2.0
+73.0,2.0
+73.0,3.0
+99.0,3.0
+99.0,4.0
+131.0,4.0
+131.0,5.0
+2000.000002,5.0
+					</series>
+					<series title="" type="l" color="0x1affff" encoding="csv">0.0,0.0
+25.0,0.0
+25.0,1.0
+83.0,1.0
+83.0,2.0
+106.0,2.0
+106.0,3.0
+136.0,3.0
+136.0,4.0
+2000.000002,4.0
+					</series>
+					<series title="" type="l" color="0x1bffff" encoding="csv">0.0,0.0
+25.0,0.0
+25.0,1.0
+48.0,1.0
+48.0,2.0
+70.0,2.0
+70.0,3.0
+99.0,3.0
+99.0,4.0
+130.0,4.0
+130.0,5.0
+2000.000002,5.0
+					</series>
+					<series title="" type="l" color="0x1cffff" encoding="csv">0.0,0.0
+30.0,0.0
+30.0,1.0
+60.0,1.0
+60.0,2.0
+150.37158974492922,2.0
+150.37158974492922,3.0
+2000.000002,3.0
+					</series>
+					<series title="" type="l" color="0x1dffff" encoding="csv">0.0,0.0
+31.0,0.0
+31.0,1.0
+101.0,1.0
+101.0,2.0
+2000.000002,2.0
+					</series>
+					<series title="" type="l" color="0x1dffff" encoding="csv">0.0,0.0
+67.28801236712509,0.0
+67.28801236712509,1.0
+95.28801236712508,1.0
+95.28801236712508,2.0
+126.28801236712508,2.0
+126.28801236712508,3.0
+153.28801236712508,3.0
+153.28801236712508,4.0
+2000.000002,4.0
+					</series>
+					<series title="" type="l" color="0x1effff" encoding="csv">0.0,0.0
+23.0,0.0
+23.0,1.0
+45.0,1.0
+45.0,2.0
+70.0,2.0
+70.0,3.0
+94.0,3.0
+94.0,4.0
+119.0,4.0
+119.0,5.0
+2000.000002,5.0
+					</series>
+					<series title="" type="l" color="0x1fffff" encoding="csv">0.0,0.0
+23.0,0.0
+23.0,1.0
+45.0,1.0
+45.0,2.0
+70.0,2.0
+70.0,3.0
+97.0,3.0
+97.0,4.0
+138.0,4.0
+138.0,5.0
+2000.000002,5.0
+					</series>
+					<series title="" type="l" color="0x20ffff" encoding="csv">0.0,0.0
+98.0,0.0
+98.0,1.0
+128.0,1.0
+128.0,2.0
+158.0,2.0
+158.0,3.0
+2000.000002,3.0
+					</series>
+					<series title="" type="l" color="0x21ffff" encoding="csv">0.0,0.0
+25.0,0.0
+25.0,1.0
+46.0,1.0
+46.0,2.0
+72.0,2.0
+72.0,3.0
+107.0,3.0
+107.0,4.0
+2000.000002,4.0
+					</series>
+					<series title="" type="l" color="0x22ffff" encoding="csv">0.0,0.0
+32.0,0.0
+32.0,1.0
+66.0,1.0
+66.0,2.0
+93.0,2.0
+93.0,3.0
+166.0,3.0
+166.0,4.0
+2000.000002,4.0
+					</series>
+					<series title="" type="l" color="0x23ffff" encoding="csv">0.0,0.0
+23.0,0.0
+23.0,1.0
+62.0,1.0
+62.0,2.0
+90.0,2.0
+90.0,3.0
+115.0,3.0
+115.0,4.0
+2000.000002,4.0
+					</series>
+					<series title="" type="l" color="0x24ffff" encoding="csv">0.0,0.0
+23.0,0.0
+23.0,1.0
+49.0,1.0
+49.0,2.0
+71.0,2.0
+71.0,3.0
+98.0,3.0
+98.0,4.0
+2000.000002,4.0
+					</series>
+					<series title="" type="l" color="0x25ffff" encoding="csv">0.0,0.0
+29.0,0.0
+29.0,1.0
+55.0,1.0
+55.0,2.0
+80.0,2.0
+80.0,3.0
+104.0,3.0
+104.0,4.0
+129.4930173973553,4.0
+129.4930173973553,5.0
+2000.000002,5.0
+					</series>
+					<series title="" type="l" color="0x25ffff" encoding="csv">0.0,0.0
+23.0,0.0
+23.0,1.0
+76.0,1.0
+76.0,2.0
+99.0,2.0
+99.0,3.0
+130.63426512293518,3.0
+130.63426512293518,4.0
+2000.000002,4.0
+					</series>
+					<series title="" type="l" color="0x26ffff" encoding="csv">0.0,0.0
+26.0,0.0
+26.0,1.0
+48.166177534731105,1.0
+48.166177534731105,2.0
+86.08388283827192,2.0
+86.08388283827192,3.0
+107.08388283827192,3.0
+107.08388283827192,4.0
+130.0838828382719,4.0
+130.0838828382719,5.0
+2000.000002,5.0
+					</series>
+					<series title="" type="l" color="0x27ffff" encoding="csv">0.0,0.0
+23.0,0.0
+23.0,1.0
+45.0,1.0
+45.0,2.0
+70.0,2.0
+70.0,3.0
+98.0,3.0
+98.0,4.0
+135.0,4.0
+135.0,5.0
+2000.000002,5.0
+					</series>
+					<series title="" type="l" color="0x28ffff" encoding="csv">0.0,0.0
+32.0,0.0
+32.0,1.0
+58.0,1.0
+58.0,2.0
+81.0,2.0
+81.0,3.0
+103.0,3.0
+103.0,4.0
+129.0,4.0
+129.0,5.0
+2000.000002,5.0
+					</series>
+					<series title="" type="l" color="0x29ffff" encoding="csv">0.0,0.0
+32.0,0.0
+32.0,1.0
+98.0,1.0
+98.0,2.0
+164.0,2.0
+164.0,3.0
+2000.000002,3.0
+					</series>
+					<series title="" type="l" color="0x2affff" encoding="csv">0.0,0.0
+28.0,0.0
+28.0,1.0
+89.0,1.0
+89.0,2.0
+2000.000002,2.0
+					</series>
+					<series title="" type="l" color="0x2bffff" encoding="csv">0.0,0.0
+32.0,0.0
+32.0,1.0
+70.0,1.0
+70.0,2.0
+99.0,2.0
+99.0,3.0
+2000.000002,3.0
+					</series>
+					<series title="" type="l" color="0x2cffff" encoding="csv">0.0,0.0
+26.0,0.0
+26.0,1.0
+50.0,1.0
+50.0,2.0
+76.0,2.0
+76.0,3.0
+99.0,3.0
+99.0,4.0
+122.0,4.0
+122.0,5.0
+2000.000002,5.0
+					</series>
+					<series title="" type="l" color="0x2dffff" encoding="csv">0.0,0.0
+33.0,0.0
+33.0,1.0
+76.0,1.0
+76.0,2.0
+104.0,2.0
+104.0,3.0
+2000.000002,3.0
+					</series>
+					<series title="" type="l" color="0x2effff" encoding="csv">0.0,0.0
+65.3173251899425,0.0
+65.3173251899425,1.0
+88.3173251899425,1.0
+88.3173251899425,2.0
+110.3173251899425,2.0
+110.3173251899425,3.0
+2000.000002,3.0
+					</series>
+					<series title="" type="l" color="0x2effff" encoding="csv">0.0,0.0
+23.0,0.0
+23.0,1.0
+48.933679160429165,1.0
+48.933679160429165,2.0
+74.93367916042916,2.0
+74.93367916042916,3.0
+103.93367916042916,3.0
+103.93367916042916,4.0
+130.93367916042916,4.0
+130.93367916042916,5.0
+2000.000002,5.0
+					</series>
+					<series title="" type="l" color="0x2fffff" encoding="csv">0.0,0.0
+31.0,0.0
+31.0,1.0
+66.0,1.0
+66.0,2.0
+122.0,2.0
+122.0,3.0
+146.0,3.0
+146.0,4.0
+2000.000002,4.0
+					</series>
+					<series title="" type="l" color="0x30ffff" encoding="csv">0.0,0.0
+25.0,0.0
+25.0,1.0
+49.0,1.0
+49.0,2.0
+72.0,2.0
+72.0,3.0
+95.99201365746558,3.0
+95.99201365746558,4.0
+132.99201365746558,4.0
+132.99201365746558,5.0
+2000.000002,5.0
+					</series>
+					<series title="" type="l" color="0x31ffff" encoding="csv">0.0,0.0
+25.0,0.0
+25.0,1.0
+83.0,1.0
+83.0,2.0
+105.0,2.0
+105.0,3.0
+129.0,3.0
+129.0,4.0
+2000.000002,4.0
+					</series>
+					<series title="" type="l" color="0x32ffff" encoding="csv">0.0,0.0
+27.0,0.0
+27.0,1.0
+48.0,1.0
+48.0,2.0
+75.86952450045219,2.0
+75.86952450045219,3.0
+140.8695245004522,3.0
+140.8695245004522,4.0
+2000.000002,4.0
+					</series>
+					<series title="" type="l" color="0x33ffff" encoding="csv">0.0,0.0
+29.0,0.0
+29.0,1.0
+51.0,1.0
+51.0,2.0
+118.0,2.0
+118.0,3.0
+150.0,3.0
+150.0,4.0
+2000.000002,4.0
+					</series>
+					<series title="" type="l" color="0x34ffff" encoding="csv">0.0,0.0
+38.0,0.0
+38.0,1.0
+63.0,1.0
+63.0,2.0
+88.0,2.0
+88.0,3.0
+110.0,3.0
+110.0,4.0
+137.0,4.0
+137.0,5.0
+2000.000002,5.0
+					</series>
+					<series title="" type="l" color="0x35ffff" encoding="csv">0.0,0.0
+27.0,0.0
+27.0,1.0
+50.0,1.0
+50.0,2.0
+72.0,2.0
+72.0,3.0
+95.0,3.0
+95.0,4.0
+125.0,4.0
+125.0,5.0
+2000.000002,5.0
+					</series>
+					<series title="" type="l" color="0x36ffff" encoding="csv">0.0,0.0
+28.0,0.0
+28.0,1.0
+95.0,1.0
+95.0,2.0
+168.8955966577769,2.0
+168.8955966577769,3.0
+2000.000002,3.0
+					</series>
+					<series title="" type="l" color="0x36ffff" encoding="csv">0.0,0.0
+23.0,0.0
+23.0,1.0
+50.0,1.0
+50.0,2.0
+75.96852066135034,2.0
+75.96852066135034,3.0
+108.96852066135034,3.0
+108.96852066135034,4.0
+131.96852066135034,4.0
+131.96852066135034,5.0
+2000.000002,5.0
+					</series>
+					<series title="" type="l" color="0x37ffff" encoding="csv">0.0,0.0
+23.0,0.0
+23.0,1.0
+46.0,1.0
+46.0,2.0
+69.48200483131222,2.0
+69.48200483131222,3.0
+2000.000002,3.0
+					</series>
+					<series title="" type="l" color="0x38ffff" encoding="csv">0.0,0.0
+27.0,0.0
+27.0,1.0
+48.0,1.0
+48.0,2.0
+75.0,2.0
+75.0,3.0
+138.0,3.0
+138.0,4.0
+2000.000002,4.0
+					</series>
+					<series title="" type="l" color="0x39ffff" encoding="csv">0.0,0.0
+30.0,0.0
+30.0,1.0
+2000.000002,1.0
+					</series>
+					<series title="" type="l" color="0x3affff" encoding="csv">0.0,0.0
+60.9284834548351,0.0
+60.9284834548351,1.0
+83.92848345483509,1.0
+83.92848345483509,2.0
+105.58743756269237,2.0
+105.58743756269237,3.0
+2000.000002,3.0
+					</series>
+					<series title="" type="l" color="0x3bffff" encoding="csv">0.0,0.0
+23.0,0.0
+23.0,1.0
+45.0,1.0
+45.0,2.0
+72.0,2.0
+72.0,3.0
+2000.000002,3.0
+					</series>
+					<series title="" type="l" color="0x3cffff" encoding="csv">0.0,0.0
+23.0,0.0
+23.0,1.0
+46.0,1.0
+46.0,2.0
+69.0,2.0
+69.0,3.0
+131.0,3.0
+131.0,4.0
+2000.000002,4.0
+					</series>
+					<series title="" type="l" color="0x3dffff" encoding="csv">0.0,0.0
+25.0,0.0
+25.0,1.0
+46.0,1.0
+46.0,2.0
+70.0,2.0
+70.0,3.0
+94.0,3.0
+94.0,4.0
+131.0,4.0
+131.0,5.0
+2000.000002,5.0
+					</series>
+					<series title="" type="l" color="0x3effff" encoding="csv">0.0,0.0
+23.0,0.0
+23.0,1.0
+45.0,1.0
+45.0,2.0
+74.0,2.0
+74.0,3.0
+97.0,3.0
+97.0,4.0
+2000.000002,4.0
+					</series>
+					<series title="" type="l" color="0x3effff" encoding="csv">0.0,0.0
+28.0,0.0
+28.0,1.0
+50.0,1.0
+50.0,2.0
+80.77137078040217,2.0
+80.77137078040217,3.0
+102.77137078040217,3.0
+102.77137078040217,4.0
+2000.000002,4.0
+					</series>
+					<series title="" type="l" color="0x3fffff" encoding="csv">0.0,0.0
+25.0,0.0
+25.0,1.0
+46.0,1.0
+46.0,2.0
+89.0,2.0
+89.0,3.0
+157.0,3.0
+157.0,4.0
+2000.000002,4.0
+					</series>
+					<series title="" type="l" color="0x40ffff" encoding="csv">0.0,0.0
+23.0,0.0
+23.0,1.0
+101.0,1.0
+101.0,2.0
+129.0,2.0
+129.0,3.0
+2000.000002,3.0
+					</series>
+					<series title="" type="l" color="0x41ffff" encoding="csv">0.0,0.0
+27.0,0.0
+27.0,1.0
+62.0,1.0
+62.0,2.0
+85.0,2.0
+85.0,3.0
+2000.000002,3.0
+					</series>
+					<series title="" type="l" color="0x42ffff" encoding="csv">0.0,0.0
+32.0,0.0
+32.0,1.0
+63.0,1.0
+63.0,2.0
+88.0,2.0
+88.0,3.0
+115.0,3.0
+115.0,4.0
+138.0,4.0
+138.0,5.0
+2000.000002,5.0
+					</series>
+					<series title="" type="l" color="0x43ffff" encoding="csv">0.0,0.0
+35.0,0.0
+35.0,1.0
+66.0,1.0
+66.0,2.0
+94.0,2.0
+94.0,3.0
+2000.000002,3.0
+					</series>
+					<series title="" type="l" color="0x44ffff" encoding="csv">0.0,0.0
+25.0,0.0
+25.0,1.0
+46.0,1.0
+46.0,2.0
+73.0,2.0
+73.0,3.0
+133.0,3.0
+133.0,4.0
+2000.000002,4.0
+					</series>
+					<series title="" type="l" color="0x45ffff" encoding="csv">0.0,0.0
+30.0,0.0
+30.0,1.0
+62.0,1.0
+62.0,2.0
+88.0,2.0
+88.0,3.0
+118.0,3.0
+118.0,4.0
+140.0,4.0
+140.0,5.0
+2000.000002,5.0
+					</series>
+					<series title="" type="l" color="0x46ffff" encoding="csv">0.0,0.0
+40.0,0.0
+40.0,1.0
+74.0,1.0
+74.0,2.0
+108.0,2.0
+108.0,3.0
+134.0,3.0
+134.0,4.0
+162.0,4.0
+162.0,5.0
+2000.000002,5.0
+					</series>
+					<series title="" type="l" color="0x47ffff" encoding="csv">0.0,0.0
+70.0,0.0
+70.0,1.0
+94.0,1.0
+94.0,2.0
+122.0,2.0
+122.0,3.0
+156.0,3.0
+156.0,4.0
+2000.000002,4.0
+					</series>
+					<series title="" type="l" color="0x47ffff" encoding="csv">0.0,0.0
+23.0,0.0
+23.0,1.0
+57.83605037400647,1.0
+57.83605037400647,2.0
+80.83605037400646,2.0
+80.83605037400646,3.0
+143.7874896397362,3.0
+143.7874896397362,4.0
+2000.000002,4.0
+					</series>
+					<series title="" type="l" color="0x48ffff" encoding="csv">0.0,0.0
+30.0,0.0
+30.0,1.0
+56.0,1.0
+56.0,2.0
+77.0,2.0
+77.0,3.0
+106.0,3.0
+106.0,4.0
+2000.000002,4.0
+					</series>
+					<series title="" type="l" color="0x49ffff" encoding="csv">0.0,0.0
+24.0,0.0
+24.0,1.0
+45.0,1.0
+45.0,2.0
+70.0,2.0
+70.0,3.0
+98.0,3.0
+98.0,4.0
+140.0,4.0
+140.0,5.0
+2000.000002,5.0
+					</series>
+					<series title="" type="l" color="0x4affff" encoding="csv">0.0,0.0
+30.0,0.0
+30.0,1.0
+99.0,1.0
+99.0,2.0
+166.0,2.0
+166.0,3.0
+2000.000002,3.0
+					</series>
+					<series title="" type="l" color="0x4bffff" encoding="csv">0.0,0.0
+25.0,0.0
+25.0,1.0
+82.0,1.0
+82.0,2.0
+104.0,2.0
+104.0,3.0
+136.0,3.0
+136.0,4.0
+2000.000002,4.0
+					</series>
+					<series title="" type="l" color="0x4cffff" encoding="csv">0.0,0.0
+31.0,0.0
+31.0,1.0
+125.0,1.0
+125.0,2.0
+162.0,2.0
+162.0,3.0
+2000.000002,3.0
+					</series>
+					<series title="" type="l" color="0x4dffff" encoding="csv">0.0,0.0
+69.0,0.0
+69.0,1.0
+116.0,1.0
+116.0,2.0
+137.0,2.0
+137.0,3.0
+160.0,3.0
+160.0,4.0
+2000.000002,4.0
+					</series>
+					<series title="" type="l" color="0x4effff" encoding="csv">0.0,0.0
+23.0,0.0
+23.0,1.0
+86.0,1.0
+86.0,2.0
+113.0,2.0
+113.0,3.0
+135.0,3.0
+135.0,4.0
+2000.000002,4.0
+					</series>
+					<series title="" type="l" color="0x4fffff" encoding="csv">0.0,0.0
+23.0,0.0
+23.0,1.0
+86.0,1.0
+86.0,2.0
+107.0,2.0
+107.0,3.0
+135.0,3.0
+135.0,4.0
+2000.000002,4.0
+					</series>
+					<series title="" type="l" color="0x4fffff" encoding="csv">0.0,0.0
+30.0,0.0
+30.0,1.0
+60.0,1.0
+60.0,2.0
+89.0,2.0
+89.0,3.0
+120.62412317004055,3.0
+120.62412317004055,4.0
+154.62412317004055,4.0
+154.62412317004055,5.0
+2000.000002,5.0
+					</series>
+					<series title="" type="l" color="0x50ffff" encoding="csv">0.0,0.0
+30.0,0.0
+30.0,1.0
+62.0,1.0
+62.0,2.0
+86.0,2.0
+86.0,3.0
+118.0,3.0
+118.0,4.0
+140.0,4.0
+140.0,5.0
+2000.000002,5.0
+					</series>
+					<series title="" type="l" color="0x51ffff" encoding="csv">0.0,0.0
+68.0,0.0
+68.0,1.0
+95.0,1.0
+95.0,2.0
+125.0,2.0
+125.0,3.0
+163.0,3.0
+163.0,4.0
+2000.000002,4.0
+					</series>
+					<series title="" type="l" color="0x52ffff" encoding="csv">0.0,0.0
+28.970443525118753,0.0
+28.970443525118753,1.0
+50.97044352511875,1.0
+50.97044352511875,2.0
+72.97044352511875,2.0
+72.97044352511875,3.0
+95.97044352511875,3.0
+95.97044352511875,4.0
+120.97044352511875,4.0
+120.97044352511875,5.0
+2000.000002,5.0
+					</series>
+					<series title="" type="l" color="0x53ffff" encoding="csv">0.0,0.0
+32.0,0.0
+32.0,1.0
+62.0,1.0
+62.0,2.0
+97.0,2.0
+97.0,3.0
+120.22558679222129,3.0
+120.22558679222129,4.0
+152.1369981775357,4.0
+152.1369981775357,5.0
+2000.000002,5.0
+					</series>
+					<series title="" type="l" color="0x54ffff" encoding="csv">0.0,0.0
+29.0,0.0
+29.0,1.0
+88.0,1.0
+88.0,2.0
+112.0,2.0
+112.0,3.0
+145.91382543437146,3.0
+145.91382543437146,4.0
+2000.000002,4.0
+					</series>
+					<series title="" type="l" color="0x55ffff" encoding="csv">0.0,0.0
+28.928528629010543,0.0
+28.928528629010543,1.0
+53.92852862901054,1.0
+53.92852862901054,2.0
+77.92852862901054,2.0
+77.92852862901054,3.0
+132.92852862901054,3.0
+132.92852862901054,4.0
+2000.000002,4.0
+					</series>
+					<series title="" type="l" color="0x56ffff" encoding="csv">0.0,0.0
+23.0,0.0
+23.0,1.0
+45.0,1.0
+45.0,2.0
+75.0,2.0
+75.0,3.0
+101.0,3.0
+101.0,4.0
+133.0,4.0
+133.0,5.0
+2000.000002,5.0
+					</series>
+					<series title="" type="l" color="0x57ffff" encoding="csv">0.0,0.0
+25.0,0.0
+25.0,1.0
+46.0,1.0
+46.0,2.0
+70.0,2.0
+70.0,3.0
+97.0,3.0
+97.0,4.0
+2000.000002,4.0
+					</series>
+					<series title="" type="l" color="0x57ffff" encoding="csv">0.0,0.0
+26.0,0.0
+26.0,1.0
+47.0,1.0
+47.0,2.0
+70.0,2.0
+70.0,3.0
+98.0,3.0
+98.0,4.0
+126.0,4.0
+126.0,5.0
+2000.000002,5.0
+					</series>
+					<series title="" type="l" color="0x58ffff" encoding="csv">0.0,0.0
+36.0,0.0
+36.0,1.0
+62.0,1.0
+62.0,2.0
+89.0,2.0
+89.0,3.0
+113.0,3.0
+113.0,4.0
+135.0,4.0
+135.0,5.0
+2000.000002,5.0
+					</series>
+					<series title="deaths_by_water" type="l" color="0x0000ff" encoding="csv">0.0,0.0
+127.0,0.0
+127.0,1.0
+2000.000002,1.0
+					</series>
+					<series title="" type="l" color="0x0101ff" encoding="csv">0.0,0.0
+70.0,0.0
+70.0,1.0
+2000.000002,1.0
+					</series>
+					<series title="" type="l" color="0x0202ff" encoding="csv">0.0,0.0
+102.0,0.0
+102.0,1.0
+2000.000002,1.0
+					</series>
+					<series title="" type="l" color="0x0303ff" encoding="csv">0.0,0.0
+29.0,0.0
+29.0,1.0
+67.0,1.0
+67.0,2.0
+2000.000002,2.0
+					</series>
+					<series title="" type="l" color="0x0404ff" encoding="csv">0.0,0.0
+134.0,0.0
+134.0,1.0
+2000.000002,1.0
+					</series>
+					<series title="" type="l" color="0x0404ff" encoding="csv">0.0,0.0
+77.54263760033064,0.0
+77.54263760033064,1.0
+2000.000002,1.0
+					</series>
+					<series title="" type="l" color="0x0505ff" encoding="csv">0.0,0.0
+2000.000002,0.0
+					</series>
+					<series title="" type="l" color="0x0606ff" encoding="csv">0.0,0.0
+60.0,0.0
+60.0,1.0
+2000.000002,1.0
+					</series>
+					<series title="" type="l" color="0x0707ff" encoding="csv">0.0,0.0
+61.0,0.0
+61.0,1.0
+2000.000002,1.0
+					</series>
+					<series title="" type="l" color="0x0808ff" encoding="csv">0.0,0.0
+61.0,0.0
+61.0,1.0
+138.0,1.0
+138.0,2.0
+2000.000002,2.0
+					</series>
+					<series title="" type="l" color="0x0909ff" encoding="csv">0.0,0.0
+79.0,0.0
+79.0,1.0
+140.0,1.0
+140.0,2.0
+2000.000002,2.0
+					</series>
+					<series title="" type="l" color="0x0a0aff" encoding="csv">0.0,0.0
+60.48798415879719,0.0
+60.48798415879719,1.0
+126.48798415879719,1.0
+126.48798415879719,2.0
+2000.000002,2.0
+					</series>
+					<series title="" type="l" color="0x0b0bff" encoding="csv">0.0,0.0
+62.0,0.0
+62.0,1.0
+145.0,1.0
+145.0,2.0
+2000.000002,2.0
+					</series>
+					<series title="" type="l" color="0x0c0cff" encoding="csv">0.0,0.0
+38.0,0.0
+38.0,1.0
+131.0,1.0
+131.0,2.0
+2000.000002,2.0
+					</series>
+					<series title="" type="l" color="0x0c0cff" encoding="csv">0.0,0.0
+108.82353332685307,0.0
+108.82353332685307,1.0
+2000.000002,1.0
+					</series>
+					<series title="" type="l" color="0x0d0dff" encoding="csv">0.0,0.0
+2000.000002,0.0
+					</series>
+					<series title="" type="l" color="0x0e0eff" encoding="csv">0.0,0.0
+65.0,0.0
+65.0,1.0
+95.0,1.0
+95.0,2.0
+2000.000002,2.0
+					</series>
+					<series title="" type="l" color="0x0f0fff" encoding="csv">0.0,0.0
+2000.000002,0.0
+					</series>
+					<series title="" type="l" color="0x1010ff" encoding="csv">0.0,0.0
+63.0,0.0
+63.0,1.0
+99.0,1.0
+99.0,2.0
+138.0,2.0
+138.0,3.0
+2000.000002,3.0
+					</series>
+					<series title="" type="l" color="0x1111ff" encoding="csv">0.0,0.0
+32.0,0.0
+32.0,1.0
+64.0,1.0
+64.0,2.0
+2000.000002,2.0
+					</series>
+					<series title="" type="l" color="0x1212ff" encoding="csv">0.0,0.0
+2000.000002,0.0
+					</series>
+					<series title="" type="l" color="0x1313ff" encoding="csv">0.0,0.0
+64.0,0.0
+64.0,1.0
+126.0,1.0
+126.0,2.0
+2000.000002,2.0
+					</series>
+					<series title="" type="l" color="0x1414ff" encoding="csv">0.0,0.0
+142.0,0.0
+142.0,1.0
+2000.000002,1.0
+					</series>
+					<series title="" type="l" color="0x1515ff" encoding="csv">0.0,0.0
+112.0,0.0
+112.0,1.0
+2000.000002,1.0
+					</series>
+					<series title="" type="l" color="0x1515ff" encoding="csv">0.0,0.0
+60.0,0.0
+60.0,1.0
+93.0,1.0
+93.0,2.0
+2000.000002,2.0
+					</series>
+					<series title="" type="l" color="0x1616ff" encoding="csv">0.0,0.0
+2000.000002,0.0
+					</series>
+					<series title="" type="l" color="0x1717ff" encoding="csv">0.0,0.0
+76.0,0.0
+76.0,1.0
+2000.000002,1.0
+					</series>
+					<series title="" type="l" color="0x1818ff" encoding="csv">0.0,0.0
+2000.000002,0.0
+					</series>
+					<series title="" type="l" color="0x1919ff" encoding="csv">0.0,0.0
+2000.000002,0.0
+					</series>
+					<series title="" type="l" color="0x1a1aff" encoding="csv">0.0,0.0
+59.0,0.0
+59.0,1.0
+2000.000002,1.0
+					</series>
+					<series title="" type="l" color="0x1b1bff" encoding="csv">0.0,0.0
+2000.000002,0.0
+					</series>
+					<series title="" type="l" color="0x1c1cff" encoding="csv">0.0,0.0
+91.0,0.0
+91.0,1.0
+121.0,1.0
+121.0,2.0
+2000.000002,2.0
+					</series>
+					<series title="" type="l" color="0x1d1dff" encoding="csv">0.0,0.0
+61.0,0.0
+61.0,1.0
+140.0,1.0
+140.0,2.0
+174.0,2.0
+174.0,3.0
+2000.000002,3.0
+					</series>
+					<series title="" type="l" color="0x1d1dff" encoding="csv">0.0,0.0
+38.0,0.0
+38.0,1.0
+2000.000002,1.0
+					</series>
+					<series title="" type="l" color="0x1e1eff" encoding="csv">0.0,0.0
+2000.000002,0.0
+					</series>
+					<series title="" type="l" color="0x1f1fff" encoding="csv">0.0,0.0
+2000.000002,0.0
+					</series>
+					<series title="" type="l" color="0x2020ff" encoding="csv">0.0,0.0
+32.0,0.0
+32.0,1.0
+70.0,1.0
+70.0,2.0
+2000.000002,2.0
+					</series>
+					<series title="" type="l" color="0x2121ff" encoding="csv">0.0,0.0
+150.0,0.0
+150.0,1.0
+2000.000002,1.0
+					</series>
+					<series title="" type="l" color="0x2222ff" encoding="csv">0.0,0.0
+145.0,0.0
+145.0,1.0
+2000.000002,1.0
+					</series>
+					<series title="" type="l" color="0x2323ff" encoding="csv">0.0,0.0
+150.0,0.0
+150.0,1.0
+2000.000002,1.0
+					</series>
+					<series title="" type="l" color="0x2424ff" encoding="csv">0.0,0.0
+135.0,0.0
+135.0,1.0
+2000.000002,1.0
+					</series>
+					<series title="" type="l" color="0x2525ff" encoding="csv">0.0,0.0
+2000.000002,0.0
+					</series>
+					<series title="" type="l" color="0x2525ff" encoding="csv">0.0,0.0
+53.0,0.0
+53.0,1.0
+2000.000002,1.0
+					</series>
+					<series title="" type="l" color="0x2626ff" encoding="csv">0.0,0.0
+2000.000002,0.0
+					</series>
+					<series title="" type="l" color="0x2727ff" encoding="csv">0.0,0.0
+2000.000002,0.0
+					</series>
+					<series title="" type="l" color="0x2828ff" encoding="csv">0.0,0.0
+2000.000002,0.0
+					</series>
+					<series title="" type="l" color="0x2929ff" encoding="csv">0.0,0.0
+70.0,0.0
+70.0,1.0
+133.0,1.0
+133.0,2.0
+2000.000002,2.0
+					</series>
+					<series title="" type="l" color="0x2a2aff" encoding="csv">0.0,0.0
+62.0,0.0
+62.0,1.0
+121.0,1.0
+121.0,2.0
+161.0,2.0
+161.0,3.0
+2000.000002,3.0
+					</series>
+					<series title="" type="l" color="0x2b2bff" encoding="csv">0.0,0.0
+131.0,0.0
+131.0,1.0
+167.0,1.0
+167.0,2.0
+2000.000002,2.0
+					</series>
+					<series title="" type="l" color="0x2c2cff" encoding="csv">0.0,0.0
+2000.000002,0.0
+					</series>
+					<series title="" type="l" color="0x2d2dff" encoding="csv">0.0,0.0
+141.0,0.0
+141.0,1.0
+171.0,1.0
+171.0,2.0
+2000.000002,2.0
+					</series>
+					<series title="" type="l" color="0x2e2eff" encoding="csv">0.0,0.0
+38.0,0.0
+38.0,1.0
+139.3173251899425,1.0
+139.3173251899425,2.0
+2000.000002,2.0
+					</series>
+					<series title="" type="l" color="0x2e2eff" encoding="csv">0.0,0.0
+2000.000002,0.0
+					</series>
+					<series title="" type="l" color="0x2f2fff" encoding="csv">0.0,0.0
+96.0,0.0
+96.0,1.0
+2000.000002,1.0
+					</series>
+					<series title="" type="l" color="0x3030ff" encoding="csv">0.0,0.0
+2000.000002,0.0
+					</series>
+					<series title="" type="l" color="0x3131ff" encoding="csv">0.0,0.0
+55.0,0.0
+55.0,1.0
+2000.000002,1.0
+					</series>
+					<series title="" type="l" color="0x3232ff" encoding="csv">0.0,0.0
+117.86952450045219,0.0
+117.86952450045219,1.0
+2000.000002,1.0
+					</series>
+					<series title="" type="l" color="0x3333ff" encoding="csv">0.0,0.0
+91.0,0.0
+91.0,1.0
+2000.000002,1.0
+					</series>
+					<series title="" type="l" color="0x3434ff" encoding="csv">0.0,0.0
+2000.000002,0.0
+					</series>
+					<series title="" type="l" color="0x3535ff" encoding="csv">0.0,0.0
+2000.000002,0.0
+					</series>
+					<series title="" type="l" color="0x3636ff" encoding="csv">0.0,0.0
+65.0,0.0
+65.0,1.0
+131.0,1.0
+131.0,2.0
+2000.000002,2.0
+					</series>
+					<series title="" type="l" color="0x3636ff" encoding="csv">0.0,0.0
+2000.000002,0.0
+					</series>
+					<series title="" type="l" color="0x3737ff" encoding="csv">0.0,0.0
+102.48200483131222,0.0
+102.48200483131222,1.0
+130.48200483131222,1.0
+130.48200483131222,2.0
+2000.000002,2.0
+					</series>
+					<series title="" type="l" color="0x3838ff" encoding="csv">0.0,0.0
+112.0,0.0
+112.0,1.0
+2000.000002,1.0
+					</series>
+					<series title="" type="l" color="0x3939ff" encoding="csv">0.0,0.0
+67.0,0.0
+67.0,1.0
+98.0,1.0
+98.0,2.0
+134.0,2.0
+134.0,3.0
+164.0,3.0
+164.0,4.0
+2000.000002,4.0
+					</series>
+					<series title="" type="l" color="0x3a3aff" encoding="csv">0.0,0.0
+33.0,0.0
+33.0,1.0
+135.58743756269237,1.0
+135.58743756269237,2.0
+2000.000002,2.0
+					</series>
+					<series title="" type="l" color="0x3b3bff" encoding="csv">0.0,0.0
+109.0,0.0
+109.0,1.0
+139.0,1.0
+139.0,2.0
+2000.000002,2.0
+					</series>
+					<series title="" type="l" color="0x3c3cff" encoding="csv">0.0,0.0
+108.0,0.0
+108.0,1.0
+2000.000002,1.0
+					</series>
+					<series title="" type="l" color="0x3d3dff" encoding="csv">0.0,0.0
+2000.000002,0.0
+					</series>
+					<series title="" type="l" color="0x3e3eff" encoding="csv">0.0,0.0
+131.0,0.0
+131.0,1.0
+2000.000002,1.0
+					</series>
+					<series title="" type="l" color="0x3e3eff" encoding="csv">0.0,0.0
+132.77137078040215,0.0
+132.77137078040215,1.0
+2000.000002,1.0
+					</series>
+					<series title="" type="l" color="0x3f3fff" encoding="csv">0.0,0.0
+133.0,0.0
+133.0,1.0
+2000.000002,1.0
+					</series>
+					<series title="" type="l" color="0x4040ff" encoding="csv">0.0,0.0
+67.0,0.0
+67.0,1.0
+165.9821829868015,1.0
+165.9821829868015,2.0
+2000.000002,2.0
+					</series>
+					<series title="" type="l" color="0x4141ff" encoding="csv">0.0,0.0
+121.0,0.0
+121.0,1.0
+163.0,1.0
+163.0,2.0
+2000.000002,2.0
+					</series>
+					<series title="" type="l" color="0x4242ff" encoding="csv">0.0,0.0
+2000.000002,0.0
+					</series>
+					<series title="" type="l" color="0x4343ff" encoding="csv">0.0,0.0
+127.0,0.0
+127.0,1.0
+166.0,1.0
+166.0,2.0
+2000.000002,2.0
+					</series>
+					<series title="" type="l" color="0x4444ff" encoding="csv">0.0,0.0
+102.0,0.0
+102.0,1.0
+2000.000002,1.0
+					</series>
+					<series title="" type="l" color="0x4545ff" encoding="csv">0.0,0.0
+2000.000002,0.0
+					</series>
+					<series title="" type="l" color="0x4646ff" encoding="csv">0.0,0.0
+2000.000002,0.0
+					</series>
+					<series title="" type="l" color="0x4747ff" encoding="csv">0.0,0.0
+47.0,0.0
+47.0,1.0
+2000.000002,1.0
+					</series>
+					<series title="" type="l" color="0x4747ff" encoding="csv">0.0,0.0
+114.83605037400646,0.0
+114.83605037400646,1.0
+2000.000002,1.0
+					</series>
+					<series title="" type="l" color="0x4848ff" encoding="csv">0.0,0.0
+139.0,0.0
+139.0,1.0
+2000.000002,1.0
+					</series>
+					<series title="" type="l" color="0x4949ff" encoding="csv">0.0,0.0
+2000.000002,0.0
+					</series>
+					<series title="" type="l" color="0x4a4aff" encoding="csv">0.0,0.0
+66.0,0.0
+66.0,1.0
+141.0,1.0
+141.0,2.0
+2000.000002,2.0
+					</series>
+					<series title="" type="l" color="0x4b4bff" encoding="csv">0.0,0.0
+55.0,0.0
+55.0,1.0
+2000.000002,1.0
+					</series>
+					<series title="" type="l" color="0x4c4cff" encoding="csv">0.0,0.0
+65.0,0.0
+65.0,1.0
+94.0,1.0
+94.0,2.0
+2000.000002,2.0
+					</series>
+					<series title="" type="l" color="0x4d4dff" encoding="csv">0.0,0.0
+40.0,0.0
+40.0,1.0
+2000.000002,1.0
+					</series>
+					<series title="" type="l" color="0x4e4eff" encoding="csv">0.0,0.0
+63.0,0.0
+63.0,1.0
+2000.000002,1.0
+					</series>
+					<series title="" type="l" color="0x4f4fff" encoding="csv">0.0,0.0
+60.0,0.0
+60.0,1.0
+2000.000002,1.0
+					</series>
+					<series title="" type="l" color="0x4f4fff" encoding="csv">0.0,0.0
+2000.000002,0.0
+					</series>
+					<series title="" type="l" color="0x5050ff" encoding="csv">0.0,0.0
+2000.000002,0.0
+					</series>
+					<series title="" type="l" color="0x5151ff" encoding="csv">0.0,0.0
+38.0,0.0
+38.0,1.0
+2000.000002,1.0
+					</series>
+					<series title="" type="l" color="0x5252ff" encoding="csv">0.0,0.0
+2000.000002,0.0
+					</series>
+					<series title="" type="l" color="0x5353ff" encoding="csv">0.0,0.0
+2000.000002,0.0
+					</series>
+					<series title="" type="l" color="0x5454ff" encoding="csv">0.0,0.0
+63.0,0.0
+63.0,1.0
+2000.000002,1.0
+					</series>
+					<series title="" type="l" color="0x5555ff" encoding="csv">0.0,0.0
+110.92852862901054,0.0
+110.92852862901054,1.0
+2000.000002,1.0
+					</series>
+					<series title="" type="l" color="0x5656ff" encoding="csv">0.0,0.0
+2000.000002,0.0
+					</series>
+					<series title="" type="l" color="0x5757ff" encoding="csv">0.0,0.0
+131.0,0.0
+131.0,1.0
+2000.000002,1.0
+					</series>
+					<series title="" type="l" color="0x5757ff" encoding="csv">0.0,0.0
+2000.000002,0.0
+					</series>
+					<series title="" type="l" color="0x5858ff" encoding="csv">0.0,0.0
+2000.000002,0.0
+					</series>
+					<series title="levels_completed" type="l" color="0xff00ff" encoding="csv">0.0,0.0
+2000.000002,0.0
+					</series>
+					<series title="" type="l" color="0xff01ff" encoding="csv">0.0,0.0
+2000.000002,0.0
+					</series>
+					<series title="" type="l" color="0xff02ff" encoding="csv">0.0,0.0
+2000.000002,0.0
+					</series>
+					<series title="" type="l" color="0xff03ff" encoding="csv">0.0,0.0
+2000.000002,0.0
+					</series>
+					<series title="" type="l" color="0xff04ff" encoding="csv">0.0,0.0
+2000.000002,0.0
+					</series>
+					<series title="" type="l" color="0xff04ff" encoding="csv">0.0,0.0
+2000.000002,0.0
+					</series>
+					<series title="" type="l" color="0xff05ff" encoding="csv">0.0,0.0
+2000.000002,0.0
+					</series>
+					<series title="" type="l" color="0xff06ff" encoding="csv">0.0,0.0
+2000.000002,0.0
+					</series>
+					<series title="" type="l" color="0xff07ff" encoding="csv">0.0,0.0
+2000.000002,0.0
+					</series>
+					<series title="" type="l" color="0xff08ff" encoding="csv">0.0,0.0
+2000.000002,0.0
+					</series>
+					<series title="" type="l" color="0xff09ff" encoding="csv">0.0,0.0
+2000.000002,0.0
+					</series>
+					<series title="" type="l" color="0xff0aff" encoding="csv">0.0,0.0
+2000.000002,0.0
+					</series>
+					<series title="" type="l" color="0xff0bff" encoding="csv">0.0,0.0
+2000.000002,0.0
+					</series>
+					<series title="" type="l" color="0xff0cff" encoding="csv">0.0,0.0
+2000.000002,0.0
+					</series>
+					<series title="" type="l" color="0xff0cff" encoding="csv">0.0,0.0
+2000.000002,0.0
+					</series>
+					<series title="" type="l" color="0xff0dff" encoding="csv">0.0,0.0
+2000.000002,0.0
+					</series>
+					<series title="" type="l" color="0xff0eff" encoding="csv">0.0,0.0
+2000.000002,0.0
+					</series>
+					<series title="" type="l" color="0xff0fff" encoding="csv">0.0,0.0
+2000.000002,0.0
+					</series>
+					<series title="" type="l" color="0xff10ff" encoding="csv">0.0,0.0
+2000.000002,0.0
+					</series>
+					<series title="" type="l" color="0xff11ff" encoding="csv">0.0,0.0
+2000.000002,0.0
+					</series>
+					<series title="" type="l" color="0xff12ff" encoding="csv">0.0,0.0
+2000.000002,0.0
+					</series>
+					<series title="" type="l" color="0xff13ff" encoding="csv">0.0,0.0
+2000.000002,0.0
+					</series>
+					<series title="" type="l" color="0xff14ff" encoding="csv">0.0,0.0
+2000.000002,0.0
+					</series>
+					<series title="" type="l" color="0xff15ff" encoding="csv">0.0,0.0
+2000.000002,0.0
+					</series>
+					<series title="" type="l" color="0xff15ff" encoding="csv">0.0,0.0
+2000.000002,0.0
+					</series>
+					<series title="" type="l" color="0xff16ff" encoding="csv">0.0,0.0
+2000.000002,0.0
+					</series>
+					<series title="" type="l" color="0xff17ff" encoding="csv">0.0,0.0
+2000.000002,0.0
+					</series>
+					<series title="" type="l" color="0xff18ff" encoding="csv">0.0,0.0
+2000.000002,0.0
+					</series>
+					<series title="" type="l" color="0xff19ff" encoding="csv">0.0,0.0
+2000.000002,0.0
+					</series>
+					<series title="" type="l" color="0xff1aff" encoding="csv">0.0,0.0
+2000.000002,0.0
+					</series>
+					<series title="" type="l" color="0xff1bff" encoding="csv">0.0,0.0
+2000.000002,0.0
+					</series>
+					<series title="" type="l" color="0xff1cff" encoding="csv">0.0,0.0
+2000.000002,0.0
+					</series>
+					<series title="" type="l" color="0xff1dff" encoding="csv">0.0,0.0
+2000.000002,0.0
+					</series>
+					<series title="" type="l" color="0xff1dff" encoding="csv">0.0,0.0
+2000.000002,0.0
+					</series>
+					<series title="" type="l" color="0xff1eff" encoding="csv">0.0,0.0
+2000.000002,0.0
+					</series>
+					<series title="" type="l" color="0xff1fff" encoding="csv">0.0,0.0
+2000.000002,0.0
+					</series>
+					<series title="" type="l" color="0xff20ff" encoding="csv">0.0,0.0
+2000.000002,0.0
+					</series>
+					<series title="" type="l" color="0xff21ff" encoding="csv">0.0,0.0
+2000.000002,0.0
+					</series>
+					<series title="" type="l" color="0xff22ff" encoding="csv">0.0,0.0
+2000.000002,0.0
+					</series>
+					<series title="" type="l" color="0xff23ff" encoding="csv">0.0,0.0
+2000.000002,0.0
+					</series>
+					<series title="" type="l" color="0xff24ff" encoding="csv">0.0,0.0
+2000.000002,0.0
+					</series>
+					<series title="" type="l" color="0xff25ff" encoding="csv">0.0,0.0
+2000.000002,0.0
+					</series>
+					<series title="" type="l" color="0xff25ff" encoding="csv">0.0,0.0
+2000.000002,0.0
+					</series>
+					<series title="" type="l" color="0xff26ff" encoding="csv">0.0,0.0
+2000.000002,0.0
+					</series>
+					<series title="" type="l" color="0xff27ff" encoding="csv">0.0,0.0
+2000.000002,0.0
+					</series>
+					<series title="" type="l" color="0xff28ff" encoding="csv">0.0,0.0
+2000.000002,0.0
+					</series>
+					<series title="" type="l" color="0xff29ff" encoding="csv">0.0,0.0
+2000.000002,0.0
+					</series>
+					<series title="" type="l" color="0xff2aff" encoding="csv">0.0,0.0
+2000.000002,0.0
+					</series>
+					<series title="" type="l" color="0xff2bff" encoding="csv">0.0,0.0
+2000.000002,0.0
+					</series>
+					<series title="" type="l" color="0xff2cff" encoding="csv">0.0,0.0
+2000.000002,0.0
+					</series>
+					<series title="" type="l" color="0xff2dff" encoding="csv">0.0,0.0
+2000.000002,0.0
+					</series>
+					<series title="" type="l" color="0xff2eff" encoding="csv">0.0,0.0
+2000.000002,0.0
+					</series>
+					<series title="" type="l" color="0xff2eff" encoding="csv">0.0,0.0
+2000.000002,0.0
+					</series>
+					<series title="" type="l" color="0xff2fff" encoding="csv">0.0,0.0
+2000.000002,0.0
+					</series>
+					<series title="" type="l" color="0xff30ff" encoding="csv">0.0,0.0
+2000.000002,0.0
+					</series>
+					<series title="" type="l" color="0xff31ff" encoding="csv">0.0,0.0
+2000.000002,0.0
+					</series>
+					<series title="" type="l" color="0xff32ff" encoding="csv">0.0,0.0
+2000.000002,0.0
+					</series>
+					<series title="" type="l" color="0xff33ff" encoding="csv">0.0,0.0
+2000.000002,0.0
+					</series>
+					<series title="" type="l" color="0xff34ff" encoding="csv">0.0,0.0
+2000.000002,0.0
+					</series>
+					<series title="" type="l" color="0xff35ff" encoding="csv">0.0,0.0
+2000.000002,0.0
+					</series>
+					<series title="" type="l" color="0xff36ff" encoding="csv">0.0,0.0
+2000.000002,0.0
+					</series>
+					<series title="" type="l" color="0xff36ff" encoding="csv">0.0,0.0
+2000.000002,0.0
+					</series>
+					<series title="" type="l" color="0xff37ff" encoding="csv">0.0,0.0
+2000.000002,0.0
+					</series>
+					<series title="" type="l" color="0xff38ff" encoding="csv">0.0,0.0
+2000.000002,0.0
+					</series>
+					<series title="" type="l" color="0xff39ff" encoding="csv">0.0,0.0
+2000.000002,0.0
+					</series>
+					<series title="" type="l" color="0xff3aff" encoding="csv">0.0,0.0
+2000.000002,0.0
+					</series>
+					<series title="" type="l" color="0xff3bff" encoding="csv">0.0,0.0
+2000.000002,0.0
+					</series>
+					<series title="" type="l" color="0xff3cff" encoding="csv">0.0,0.0
+2000.000002,0.0
+					</series>
+					<series title="" type="l" color="0xff3dff" encoding="csv">0.0,0.0
+2000.000002,0.0
+					</series>
+					<series title="" type="l" color="0xff3eff" encoding="csv">0.0,0.0
+2000.000002,0.0
+					</series>
+					<series title="" type="l" color="0xff3eff" encoding="csv">0.0,0.0
+2000.000002,0.0
+					</series>
+					<series title="" type="l" color="0xff3fff" encoding="csv">0.0,0.0
+2000.000002,0.0
+					</series>
+					<series title="" type="l" color="0xff40ff" encoding="csv">0.0,0.0
+2000.000002,0.0
+					</series>
+					<series title="" type="l" color="0xff41ff" encoding="csv">0.0,0.0
+2000.000002,0.0
+					</series>
+					<series title="" type="l" color="0xff42ff" encoding="csv">0.0,0.0
+2000.000002,0.0
+					</series>
+					<series title="" type="l" color="0xff43ff" encoding="csv">0.0,0.0
+2000.000002,0.0
+					</series>
+					<series title="" type="l" color="0xff44ff" encoding="csv">0.0,0.0
+2000.000002,0.0
+					</series>
+					<series title="" type="l" color="0xff45ff" encoding="csv">0.0,0.0
+2000.000002,0.0
+					</series>
+					<series title="" type="l" color="0xff46ff" encoding="csv">0.0,0.0
+2000.000002,0.0
+					</series>
+					<series title="" type="l" color="0xff47ff" encoding="csv">0.0,0.0
+2000.000002,0.0
+					</series>
+					<series title="" type="l" color="0xff47ff" encoding="csv">0.0,0.0
+2000.000002,0.0
+					</series>
+					<series title="" type="l" color="0xff48ff" encoding="csv">0.0,0.0
+2000.000002,0.0
+					</series>
+					<series title="" type="l" color="0xff49ff" encoding="csv">0.0,0.0
+2000.000002,0.0
+					</series>
+					<series title="" type="l" color="0xff4aff" encoding="csv">0.0,0.0
+2000.000002,0.0
+					</series>
+					<series title="" type="l" color="0xff4bff" encoding="csv">0.0,0.0
+2000.000002,0.0
+					</series>
+					<series title="" type="l" color="0xff4cff" encoding="csv">0.0,0.0
+2000.000002,0.0
+					</series>
+					<series title="" type="l" color="0xff4dff" encoding="csv">0.0,0.0
+2000.000002,0.0
+					</series>
+					<series title="" type="l" color="0xff4eff" encoding="csv">0.0,0.0
+2000.000002,0.0
+					</series>
+					<series title="" type="l" color="0xff4fff" encoding="csv">0.0,0.0
+2000.000002,0.0
+					</series>
+					<series title="" type="l" color="0xff4fff" encoding="csv">0.0,0.0
+2000.000002,0.0
+					</series>
+					<series title="" type="l" color="0xff50ff" encoding="csv">0.0,0.0
+2000.000002,0.0
+					</series>
+					<series title="" type="l" color="0xff51ff" encoding="csv">0.0,0.0
+2000.000002,0.0
+					</series>
+					<series title="" type="l" color="0xff52ff" encoding="csv">0.0,0.0
+2000.000002,0.0
+					</series>
+					<series title="" type="l" color="0xff53ff" encoding="csv">0.0,0.0
+2000.000002,0.0
+					</series>
+					<series title="" type="l" color="0xff54ff" encoding="csv">0.0,0.0
+2000.000002,0.0
+					</series>
+					<series title="" type="l" color="0xff55ff" encoding="csv">0.0,0.0
+2000.000002,0.0
+					</series>
+					<series title="" type="l" color="0xff56ff" encoding="csv">0.0,0.0
+2000.000002,0.0
+					</series>
+					<series title="" type="l" color="0xff57ff" encoding="csv">0.0,0.0
+2000.000002,0.0
+					</series>
+					<series title="" type="l" color="0xff57ff" encoding="csv">0.0,0.0
+2000.000002,0.0
+					</series>
+					<series title="" type="l" color="0xff58ff" encoding="csv">0.0,0.0
+2000.000002,0.0
+					</series>
+					<comment/>
+				</plot>
+			</result>
+		</query>
+	</queries>
+</nta>

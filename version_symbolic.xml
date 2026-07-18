@@ -1,0 +1,920 @@
+<?xml version="1.0" encoding="utf-8"?>
+<!DOCTYPE nta PUBLIC '-//Uppaal Team//DTD Flat System 1.6//EN' 'http://www.it.uu.se/research/group/darts/uppaal/flat-1_6.dtd'>
+<nta>
+	<declaration>// ============================================
+// GLOBAL CONSTANTS
+// ============================================
+
+const int COLS = 18;
+const int ROWS = 13;
+const int VIRTUAL_W = 20;
+
+const int SAFE = 0;
+const int ROAD = 1;
+const int WATER = 2;
+const int HOME = 3;
+const int DEADLY = 4;
+
+const int LOG_TYPE = 0;
+const int TURTLE_TYPE = 1;
+
+const int EMERGED = 0;
+const int DIVING_STATE = 1;
+const int SUBMERGED_STATE = 2;
+const int EMERGING_STATE = 3;
+
+const int div_duration[4] = {10, 5, 10, 5};
+
+const int LEFT = -1;
+const int RIGHT = 1;
+
+// Bounds of the map row bands. Used by getCellType and submergeFrogger to
+// avoid scattered numeric literals in the code.
+const int SAFE_ROW_LOW = 0;
+const int SAFE_ROW_MID = 6;
+const int ROAD_ROW_MIN = 1;
+const int ROAD_ROW_MAX = 5;
+const int WATER_ROW_MIN = 7;
+const int WATER_ROW_MAX = 11;
+const int HOME_ROW = 12;
+
+const int DEATH_NONE = 0;
+const int DEATH_VEHICLE = 1;
+const int DEATH_WATER = 2;
+const int DEATH_SUBMERGED_TURTLE = 3;
+const int DEATH_TIMEOUT = 4;
+const int DEATH_DEADLY_CELL = 5;
+
+const int N_VEHICLES = 12;
+const int N_FLOATING = 11;
+const int N_DIVING = 5;
+const int N_BAYS = 5;
+
+const int FROG_WAIT = 20;
+const int FROG_MIN_MOVE = 1;
+const int INITIAL_LIVES = 5;
+const int FROG_START_X = 9;
+const int FROG_START_Y = 0;
+const int BASE_TIMEOUT = 300;
+
+// High-level events between Frogger and GameManager.
+urgent broadcast chan frog_died;
+urgent broadcast chan frog_home;
+
+// Static definitions of moving objects. The row is an immutable membership
+// of the lane, NOT a dynamic coordinate. The current horizontal position is
+// derived as baseX + row_offset[row].
+typedef struct {
+    int baseX;
+    int row;
+    int size;
+} VehicleDef;
+
+typedef struct {
+    int baseX;
+    int row;
+    int size;
+    int kind;
+} FloatingDef;
+
+typedef struct {
+    int baseX;
+    int row;
+} DivingDef;
+
+const VehicleDef vehicles[N_VEHICLES] = {
+    {4,1,1}, {14,1,1},
+    {2,2,1}, {11,2,1},
+    {4,3,1}, {8,3,1}, {13,3,1}, {17,3,1},
+    {2,4,1}, {10,4,1},
+    {4,5,2}, {15,5,2}
+};
+
+const FloatingDef floatingObjects[N_FLOATING] = {
+    {5,7,1,TURTLE_TYPE}, {7,7,1,TURTLE_TYPE}, {9,7,1,TURTLE_TYPE},
+    {9,8,3,LOG_TYPE}, {13,8,3,LOG_TYPE}, {17,8,3,LOG_TYPE},
+    {11,9,9,LOG_TYPE},
+    {1,10,1,TURTLE_TYPE}, {3,10,1,TURTLE_TYPE},
+    {5,11,5,LOG_TYPE}, {17,11,5,LOG_TYPE}
+};
+
+const DivingDef divingTurtles[N_DIVING] = {
+    {13,7}, {15,7}, {17,7},
+    {9,10}, {11,10}
+};
+
+// Speed and direction of each lane.
+const int row_speed[ROWS] = {0,3,10,5,4,7,0,6,2,7,2,2,0};
+const int row_dir[ROWS] = {0,LEFT,RIGHT,LEFT,RIGHT,LEFT,0,LEFT,RIGHT,RIGHT,LEFT,RIGHT,0};
+
+int row_offset[ROWS] = {0,0,0,0,0,0,0,0,0,0,0,0,0};
+
+int globalDivState = EMERGED;
+clock globalClock;
+
+int frogX = FROG_START_X;
+int frogY = FROG_START_Y;
+int carried_by_row = -1;
+int last_death_cause = DEATH_NONE;
+bool frogAlive = true;
+
+int lives = INITIAL_LIVES;
+int score = 0;
+int level = 1;
+int baysOccupied = 0;
+bool bayOccupied[N_BAYS] = {false, false, false, false, false};
+
+// Observer variables: they do not affect the game logic.
+bool reached_bay_0 = false;
+bool reached_bay_2_with_17 = false;
+bool reached_row_6_after_two_deaths = false;
+bool died_by_submerged_turtle = false;
+
+// ============================================
+// PURE FUNCTIONS / SHARED PREDICATES
+// ============================================
+
+/**
+ * Classifies cell (x,y) by type: SAFE (safe), ROAD (road), WATER (deadly
+ * water), HOME (home bay) or DEADLY (deadly cell of the bay row).
+ * @param x  column in [0, COLS-1]
+ * @param y  row in [0, ROWS-1]
+ * @return  cell type code (SAFE/ROAD/WATER/HOME/DEADLY)
+ */
+int getCellType(int x, int y) {
+    if (y == SAFE_ROW_LOW || y == SAFE_ROW_MID) return SAFE;
+    if (y &gt;= ROAD_ROW_MIN &amp;&amp; y &lt;= ROAD_ROW_MAX) return ROAD;
+    if (y &gt;= WATER_ROW_MIN &amp;&amp; y &lt;= WATER_ROW_MAX) return WATER;
+    if (y == HOME_ROW) {
+        if (x % 4 == 0 || x % 4 == 1) return HOME;
+        return DEADLY;
+    }
+    return SAFE;
+}
+
+/**
+ * Maps a column x to the index of its home bay (0..4).
+ * Bays occupy the column pairs (0,1),(4,5),(8,9),(12,13),(16,17).
+ * @param x  column in [0, COLS-1]
+ * @return  bay index 0..4, or -1 if x does not belong to any bay
+ */
+int getBayIndex(int x) {
+    if (x == 0 || x == 1) return 0;
+    if (x == 4 || x == 5) return 1;
+    if (x == 8 || x == 9) return 2;
+    if (x == 12 || x == 13) return 3;
+    if (x == 16 || x == 17) return 4;
+    return -1;
+}
+
+/**
+ * Predicate: cell (x,y) is a home bay cell, regardless of whether it is
+ * already occupied.
+ * @param x  column
+ * @param y  row
+ * @return  true if (x,y) is a bay cell, false otherwise
+ */
+bool isHomeCell(int x, int y) {
+    return y == 12 &amp;&amp; getBayIndex(x) &gt;= 0;
+}
+
+/**
+ * Predicate: cell (x,y) is a currently free (occupiable) bay.
+ * @param x  column
+ * @param y  row
+ * @return  true if (x,y) is a not-yet-occupied bay, false otherwise
+ */
+bool isFreeHomeCell(int x, int y) {
+    int bay;
+    bay = getBayIndex(x);
+    return y == 12 &amp;&amp; bay &gt;= 0 &amp;&amp; !bayOccupied[bay];
+}
+
+/**
+ * Current round timeout, in time units. At level k the timeout equals
+ * BASE_TIMEOUT - 20*(k-1) (i.e. 30 - 2*(k-1) seconds), with a minimum of 1.
+ * @return  maximum time of the current round
+ */
+int currentTimeout() {
+    int timeout;
+    timeout = BASE_TIMEOUT - 20 * (level - 1);
+    if (timeout &lt; 1) return 1;
+    return timeout;
+}
+
+/**
+ * Current horizontal coordinate of an object given its immutable baseX and
+ * its row. Derived as baseX + row_offset[row] with wrap-around on VIRTUAL_W.
+ * @param base_x  initial (fixed) column of the object
+ * @param row     row of the object (selects the current offset)
+ * @return  current virtual column in [0, VIRTUAL_W-1]
+ */
+int effective_x(int base_x, int row) {
+    return (base_x + row_offset[row] + VIRTUAL_W) % VIRTUAL_W;
+}
+
+/**
+ * Predicate: a virtual coordinate falls in the visible portion of the map,
+ * i.e. in [0, COLS-1]. Columns [COLS, VIRTUAL_W-1] are the offscreen buffer
+ * for the wrap-around (difficulty B).
+ * @param virtualX  virtual column in [0, VIRTUAL_W-1]
+ * @return  true if the column is on-screen, false otherwise
+ */
+bool isVisible(int virtualX) {
+    return virtualX &gt;= 0 &amp;&amp; virtualX &lt; COLS;
+}
+
+/**
+ * Predicate: Frogger at (x,y) is on a vehicle. Iterates the vehicles of row y
+ * and computes the cells they occupy (with wrap-around and visibility).
+ * @param x  Frogger column
+ * @param y  Frogger row
+ * @return  true if a vehicle covers cell (x,y), false otherwise
+ */
+bool isOnAnyVehicle(int x, int y) {
+    int i;
+    int j;
+    int ex;
+    int cell;
+    for (i = 0; i &lt; N_VEHICLES; i++) {
+        if (vehicles[i].row == y) {
+            ex = effective_x(vehicles[i].baseX, vehicles[i].row);
+            for (j = 0; j &lt; vehicles[i].size; j++) {
+                cell = (ex - row_dir[y] * j + VIRTUAL_W) % VIRTUAL_W;
+                if (isVisible(cell) &amp;&amp; cell == x) return true;
+            }
+        }
+    }
+    return false;
+}
+
+/**
+ * Predicate: Frogger at (x,y) is on a floating object (log, turtle, or
+ * non-submerged diving turtle). Submerged turtles are excluded (Frogger
+ * would fall into the water).
+ * @param x  Frogger column
+ * @param y  Frogger row
+ * @return  true if a floating object covers (x,y), false otherwise
+ */
+bool isOnAnyFloatingObject(int x, int y) {
+    int i;
+    int j;
+    int ex;
+    int cell;
+    for (i = 0; i &lt; N_FLOATING; i++) {
+        if (floatingObjects[i].row == y) {
+            ex = effective_x(floatingObjects[i].baseX, floatingObjects[i].row);
+            for (j = 0; j &lt; floatingObjects[i].size; j++) {
+                cell = (ex - row_dir[y] * j + VIRTUAL_W) % VIRTUAL_W;
+                if (isVisible(cell) &amp;&amp; cell == x) return true;
+            }
+        }
+    }
+    if (globalDivState != SUBMERGED_STATE) {
+        for (i = 0; i &lt; N_DIVING; i++) {
+            if (divingTurtles[i].row == y) {
+                ex = effective_x(divingTurtles[i].baseX, divingTurtles[i].row);
+                if (isVisible(ex) &amp;&amp; ex == x) return true;
+            }
+        }
+    }
+    return false;
+}
+
+/**
+ * Predicate: (x,y) is a safe water cell because it is enclosed between two
+ * turtles of the same group (turtles separated by at most one cell).
+ * Checks that a turtle exists immediately to the left and one immediately
+ * to the right of x (with wrap-around on VIRTUAL_W, the same 20-cell ring
+ * used by effective_x and the carry, so the offscreen buffer columns 18-19
+ * are not collapsed onto the visible seam).
+ * @param x  Frogger column
+ * @param y  Frogger row
+ * @return  true if x lies in the gap of a turtle group, false otherwise
+ */
+bool isBetweenTurtleGroup(int x, int y) {
+    bool hasLeft;
+    bool hasRight;
+    int i;
+    int ex;
+    hasLeft = false;
+    hasRight = false;
+
+    for (i = 0; i &lt; N_FLOATING; i++) {
+        if (floatingObjects[i].row == y &amp;&amp; floatingObjects[i].kind == TURTLE_TYPE) {
+            ex = effective_x(floatingObjects[i].baseX, floatingObjects[i].row);
+            if (isVisible(ex)) {
+                if (((x - ex + VIRTUAL_W) % VIRTUAL_W) == 1) hasLeft = true;
+                if (((ex - x + VIRTUAL_W) % VIRTUAL_W) == 1) hasRight = true;
+            }
+        }
+    }
+
+    if (globalDivState != SUBMERGED_STATE) {
+        for (i = 0; i &lt; N_DIVING; i++) {
+            if (divingTurtles[i].row == y) {
+                ex = effective_x(divingTurtles[i].baseX, divingTurtles[i].row);
+                if (isVisible(ex)) {
+                    if (((x - ex + COLS) % COLS) == 1) hasLeft = true;
+                    if (((ex - x + COLS) % COLS) == 1) hasRight = true;
+                }
+            }
+        }
+    }
+    return hasLeft &amp;&amp; hasRight;
+}
+
+/**
+ * Predicate: cell (x,y) is currently safe for Frogger. SAFE is always safe;
+ * DEADLY never; ROAD safe if no vehicle; WATER safe if on a floating object
+ * or in a turtle-group gap; HOME safe if the bay is free.
+ * @param x  Frogger column
+ * @param y  Frogger row
+ * @return  true if Frogger can stand on (x,y) without dying, false otherwise
+ */
+bool isSafeCell(int x, int y) {
+    int type;
+    type = getCellType(x, y);
+    if (type == SAFE) return true;
+    if (type == DEADLY) return false;
+    if (type == ROAD) return !isOnAnyVehicle(x, y);
+    if (type == WATER) return isOnAnyFloatingObject(x, y) || isBetweenTurtleGroup(x, y);
+    if (type == HOME) return isFreeHomeCell(x, y);
+    return false;
+}
+
+/**
+ * Predicate (symbolic version, up-only movement): Frogger can move one cell
+ * upward. Only entering an already-occupied bay is forbidden; every other
+ * cell is allowed (even deadly: death is handled downstream).
+ * @return  true if the upward move is allowed, false otherwise
+ */
+bool canMoveUpSymbolic() {
+    int nextY;
+    int type;
+    nextY = frogY + 1;
+    if (frogY &gt;= 12) return false;
+    type = getCellType(frogX, nextY);
+    if (type == HOME) return isFreeHomeCell(frogX, nextY);
+    return true;
+}
+
+/**
+ * Predicate: Frogger at (x,y) is on a log (type LOG_TYPE). Used by query VI.
+ * Excludes turtles and diving turtles.
+ * @param x  Frogger column
+ * @param y  Frogger row
+ * @return  true if a log covers cell (x,y), false otherwise
+ */
+bool isOnLog(int x, int y) {
+    int i;
+    int j;
+    int ex;
+    int cell;
+    for (i = 0; i &lt; N_FLOATING; i++) {
+        if (floatingObjects[i].row == y &amp;&amp; floatingObjects[i].kind == LOG_TYPE) {
+            ex = effective_x(floatingObjects[i].baseX, floatingObjects[i].row);
+            for (j = 0; j &lt; floatingObjects[i].size; j++) {
+                cell = (ex - row_dir[y] * j + VIRTUAL_W) % VIRTUAL_W;
+                if (isVisible(cell) &amp;&amp; cell == x) return true;
+            }
+        }
+    }
+    return false;
+}
+
+/**
+ * Updates the observer flags used by queries V and VII. Does not affect the
+ * game logic: it only records that Frogger reached row 6 after at least two
+ * deaths and that it died on a submerged turtle.
+ */
+void updateObservationFlags() {
+    if (frogY == 6 &amp;&amp; (INITIAL_LIVES - lives) &gt;= 2) {
+        reached_row_6_after_two_deaths = true;
+    }
+    if (last_death_cause == DEATH_SUBMERGED_TURTLE) {
+        died_by_submerged_turtle = true;
+    }
+}
+
+/**
+ * Predicate (query II): every vehicle, floating object and diving turtle
+ * stays in its predefined row. In the model the row is an immutable member
+ * of the lane, so the property verifies the design invariant.
+ * @return  true if all objects are in their expected rows, false otherwise
+ */
+bool allObjectsStayInRows() {
+    int i;
+    for (i = 0; i &lt; N_VEHICLES; i++) {
+        if (vehicles[i].row &lt; 1 || vehicles[i].row &gt; 5) return false;
+    }
+    for (i = 0; i &lt; N_FLOATING; i++) {
+        if (floatingObjects[i].row &lt; 7 || floatingObjects[i].row &gt; 11) return false;
+    }
+    for (i = 0; i &lt; N_DIVING; i++) {
+        if (divingTurtles[i].row != 7 &amp;&amp; divingTurtles[i].row != 10) return false;
+    }
+    return true;
+}
+
+/**
+ * Predicate (query II): every row_offset stays in [0, VIRTUAL_W-1], which is
+ * guaranteed by the modulo-VIRTUAL_W update. Verifies the design invariant
+ * of the horizontal movement.
+ * @return  true if all offsets are valid, false otherwise
+ */
+bool allRowsHaveValidOffsets() {
+    int r;
+    for (r = 0; r &lt; ROWS; r++) {
+        if (row_offset[r] &lt; 0 || row_offset[r] &gt;= VIRTUAL_W) return false;
+    }
+    return true;
+}
+</declaration>
+	<template>
+		<name>GameManager</name>
+		<declaration>// GameManager centralizes the global rules: lives, bays, score, reset and
+// new levels. Frogger and the environment signal events; the manager applies
+// the consequences on the global state.
+
+/**
+ * Repositions Frogger on the starting cell, brings it back to life and
+ * cancels any floating-object carry. Does not touch lives, score or bays.
+ */
+void resetFrogger() {
+    frogX = FROG_START_X;
+    frogY = FROG_START_Y;
+    frogAlive = true;
+    carried_by_row = -1;
+}
+
+/**
+ * Handles Frogger's death: decrements the lives and repositions it — but
+ * ONLY if the game continues (lives &gt; 0 after the decrement). On the last
+ * death (lives becomes 0) the frog is left dead so that, once the manager
+ * reaches GameOver, it cannot play a post-game "ghost life" and accrue
+ * further score; it idles out the remaining time without scoring.
+ * The timeout and clocks are reset by the caller (Frogger template).
+ */
+void processDeath() {
+    lives = lives - 1;
+    if (lives &gt; 0) resetFrogger();
+}
+
+/**
+ * Handles reaching a free bay: occupies it, adds +5 points, updates the
+ * observer flags of queries III/IV and, if all bays are filled, awards +100
+ * points, clears the bays and advances the level.
+ * Pre: frogX identifies a free bay (bay &gt;= 0), guaranteed by the
+ * isFreeHomeCell guard on the HomeDetected transition.
+ */
+void processHomeBay() {
+    int bay;
+    int i;
+    bay = getBayIndex(frogX);
+
+    bayOccupied[bay] = true;
+    baysOccupied = baysOccupied + 1;
+    score = score + 5;
+
+    if (bay == 0) reached_bay_0 = true;
+    if (bay == 2 &amp;&amp; score == 17) reached_bay_2_with_17 = true;
+
+    if (baysOccupied == N_BAYS) {
+        score = score + 100;
+        for (i = 0; i &lt; N_BAYS; i++) {
+            bayOccupied[i] = false;
+        }
+        baysOccupied = 0;
+        level = level + 1;
+    }
+
+    resetFrogger();
+}</declaration>
+		<location id="id0" x="-160" y="-80">
+			<name x="-170" y="-114">Running</name>
+		</location>
+		<location id="id1" x="100" y="-80">
+			<name x="90" y="-114">Resetting</name>
+			<committed/>
+		</location>
+		<location id="id2" x="320" y="-80">
+			<name x="310" y="-114">GameOver</name>
+		</location>
+		<init ref="id0"/>
+		<transition id="id3">
+			<source ref="id0"/>
+			<target ref="id1"/>
+			<label kind="synchronisation" x="-90" y="-140">frog_died?</label>
+			<label kind="assignment" x="-90" y="-123">processDeath()</label>
+		</transition>
+		<transition id="id4">
+			<source ref="id0"/>
+			<target ref="id1"/>
+			<label kind="synchronisation" x="-80" y="30">frog_home?</label>
+			<label kind="assignment" x="-80" y="47">processHomeBay()</label>
+			<nail x="-60" y="20"/>
+			<nail x="100" y="20"/>
+		</transition>
+		<transition id="id5">
+			<source ref="id1"/>
+			<target ref="id0"/>
+			<label kind="guard" x="-40" y="90">lives &gt; 0</label>
+			<nail x="100" y="80"/>
+			<nail x="-160" y="80"/>
+		</transition>
+		<transition id="id6">
+			<source ref="id1"/>
+			<target ref="id2"/>
+			<label kind="guard" x="170" y="-120">lives &lt;= 0</label>
+		</transition>
+	</template>
+	<template>
+		<name>Frogger</name>
+		<declaration>// Frogger handles only the player's behavior: initial wait, symbolic upward
+// movement, timeout and signaling of death/home to the GameManager.
+clock moveClock;
+clock waitClock;
+clock roundClock;
+
+/**
+ * Performs a single upward hop (symbolic version): +1 row, +1 point, reset
+ * of the carry. Then classifies the destination cell: DEADLY and
+ * ROAD-with-vehicle = death; WATER = survival only on a floating object or
+ * turtle gap (otherwise death by drowning); other cases safe.
+ */
+void frogMoveUp() {
+    int type;
+    frogY = frogY + 1;
+    score = score + 1;
+    carried_by_row = -1;
+
+    type = getCellType(frogX, frogY);
+
+    if (type == DEADLY) {
+        frogAlive = false;
+        last_death_cause = DEATH_DEADLY_CELL;
+        updateObservationFlags();
+        return;
+    }
+
+    if (type == ROAD &amp;&amp; isOnAnyVehicle(frogX, frogY)) {
+        frogAlive = false;
+        last_death_cause = DEATH_VEHICLE;
+        updateObservationFlags();
+        return;
+    }
+
+    if (type == WATER) {
+        if (isOnAnyFloatingObject(frogX, frogY) || isBetweenTurtleGroup(frogX, frogY)) {
+            carried_by_row = frogY;
+        } else {
+            frogAlive = false;
+            last_death_cause = DEATH_WATER;
+            updateObservationFlags();
+            return;
+        }
+    }
+
+    updateObservationFlags();
+}</declaration>
+		<location id="id7" x="-360" y="-80">
+			<name x="-390" y="-114">Waiting</name>
+			<label kind="invariant" x="-405" y="-63">waitClock &lt;= FROG_WAIT</label>
+		</location>
+		<location id="id8" x="-80" y="-80">
+			<name x="-105" y="-114">Playing</name>
+			<label kind="invariant" x="-135" y="-63">roundClock &lt;= currentTimeout()</label>
+		</location>
+		<location id="id9" x="100" y="-210">
+			<name x="70" y="-244">HomeDetected</name>
+			<committed/>
+		</location>
+		<location id="id10" x="100" y="40">
+			<name x="70" y="6">DeathDetected</name>
+			<committed/>
+		</location>
+		<location id="id11" x="100" y="-80">
+			<name x="55" y="-114">TimeoutDetected</name>
+			<committed/>
+		</location>
+		<init ref="id7"/>
+		<transition id="id12">
+			<source ref="id7"/>
+			<target ref="id8"/>
+			<label kind="guard" x="-310" y="-130">waitClock &gt;= FROG_WAIT</label>
+			<label kind="assignment" x="-310" y="-113">moveClock = 0, roundClock = 0</label>
+		</transition>
+		<transition id="id13">
+			<source ref="id8"/>
+			<target ref="id8"/>
+			<label kind="guard" x="-150" y="80">frogAlive &amp;&amp; moveClock &gt;= FROG_MIN_MOVE &amp;&amp; roundClock &lt; currentTimeout() &amp;&amp; canMoveUpSymbolic()</label>
+			<label kind="assignment" x="-150" y="97">frogMoveUp(), moveClock = 0</label>
+			<nail x="-130" y="80"/>
+			<nail x="-20" y="80"/>
+		</transition>
+		<transition id="id14">
+			<source ref="id8"/>
+			<target ref="id9"/>
+			<label kind="guard" x="-60" y="-195">frogAlive &amp;&amp; isFreeHomeCell(frogX, frogY)</label>
+		</transition>
+		<transition id="id15">
+			<source ref="id9"/>
+			<target ref="id7"/>
+			<label kind="synchronisation" x="-145" y="-250">frog_home!</label>
+			<label kind="assignment" x="-145" y="-233">waitClock = 0, moveClock = 0, roundClock = 0</label>
+			<nail x="-80" y="-240"/>
+			<nail x="-360" y="-240"/>
+		</transition>
+		<transition id="id16">
+			<source ref="id8"/>
+			<target ref="id10"/>
+			<label kind="guard" x="-40" y="15">!frogAlive</label>
+			<label kind="assignment" x="-40" y="32">updateObservationFlags()</label>
+		</transition>
+		<transition id="id17">
+			<source ref="id10"/>
+			<target ref="id7"/>
+			<label kind="synchronisation" x="-145" y="125">frog_died!</label>
+			<label kind="assignment" x="-145" y="142">waitClock = 0, moveClock = 0, roundClock = 0</label>
+			<nail x="-80" y="120"/>
+			<nail x="-360" y="120"/>
+		</transition>
+		<transition id="id18">
+			<source ref="id8"/>
+			<target ref="id11"/>
+			<label kind="guard" x="-40" y="-105">frogAlive &amp;&amp; roundClock &gt;= currentTimeout()</label>
+			<label kind="assignment" x="-40" y="-88">frogAlive = false, last_death_cause = DEATH_TIMEOUT, updateObservationFlags()</label>
+		</transition>
+		<transition id="id19">
+			<source ref="id11"/>
+			<target ref="id7"/>
+			<label kind="synchronisation" x="-145" y="-25">frog_died!</label>
+			<label kind="assignment" x="-145" y="-8">waitClock = 0, moveClock = 0, roundClock = 0</label>
+			<nail x="-80" y="-20"/>
+			<nail x="-360" y="-20"/>
+		</transition>
+	</template>
+	<template>
+		<name>VehicleLane</name>
+		<parameter>const int row</parameter>
+		<declaration>// VehicleLane is the timed agent of the road rows. The lane moves all
+// vehicles of the row horizontally by updating the shared offset, then
+// checks whether a vehicle has hit Frogger.
+clock t;
+
+/**
+ * After the lane shift, checks whether a vehicle of the row has run over
+ * Frogger standing on the same row. If so, marks death by vehicle. Called
+ * in the committed location CheckingCollision.
+ */
+void checkCollision() {
+    if (frogY == row &amp;&amp; isOnAnyVehicle(frogX, frogY)) {
+        frogAlive = false;
+        last_death_cause = DEATH_VEHICLE;
+    }
+}</declaration>
+		<location id="id20" x="-200" y="-80">
+			<name x="-210" y="-114">WaitingForShift</name>
+			<label kind="invariant" x="-210" y="-63">t &lt;= row_speed[row]</label>
+		</location>
+		<location id="id21" x="120" y="-80">
+			<name x="110" y="-114">CheckingCollision</name>
+			<committed/>
+		</location>
+		<init ref="id20"/>
+		<transition id="id22">
+			<source ref="id20"/>
+			<target ref="id21"/>
+			<label kind="guard" x="-140" y="-130">t == row_speed[row]</label>
+			<label kind="assignment" x="-140" y="-113">row_offset[row] = (row_offset[row] + row_dir[row] + VIRTUAL_W) % VIRTUAL_W</label>
+		</transition>
+		<transition id="id23">
+			<source ref="id21"/>
+			<target ref="id20"/>
+			<label kind="assignment" x="-30" y="30">checkCollision(), t = 0</label>
+			<nail x="120" y="40"/>
+			<nail x="-200" y="40"/>
+		</transition>
+	</template>
+	<template>
+		<name>FloatingLane</name>
+		<parameter>const int row</parameter>
+		<declaration>// FloatingLane is the timed agent of the river rows. The lane moves
+// logs/turtles by updating the shared offset and, if Frogger is on this row,
+// carries it in the same direction.
+clock t;
+
+/**
+ * After the lane shift, if Frogger is being carried by this row it is moved
+ * horizontally in the lane's direction (with wrap-around on VIRTUAL_W,
+ * difficulty B). If it re-enters the screen on a non-safe cell, it dies by
+ * drowning. Called in the committed location CarryingFrogger.
+ */
+void carryFroggerIfNeeded() {
+    if (carried_by_row != row) return;
+
+    frogX = (frogX + row_dir[row] + VIRTUAL_W) % VIRTUAL_W;
+
+    if (isVisible(frogX) &amp;&amp; !isSafeCell(frogX, frogY)) {
+        frogAlive = false;
+        last_death_cause = DEATH_WATER;
+    }
+
+    updateObservationFlags();
+}</declaration>
+		<location id="id24" x="-200" y="-80">
+			<name x="-210" y="-114">WaitingForShift</name>
+			<label kind="invariant" x="-210" y="-63">t &lt;= row_speed[row]</label>
+		</location>
+		<location id="id25" x="120" y="-80">
+			<name x="110" y="-114">CarryingFrogger</name>
+			<committed/>
+		</location>
+		<init ref="id24"/>
+		<transition id="id26">
+			<source ref="id24"/>
+			<target ref="id25"/>
+			<label kind="guard" x="-140" y="-130">t == row_speed[row]</label>
+			<label kind="assignment" x="-140" y="-113">row_offset[row] = (row_offset[row] + row_dir[row] + VIRTUAL_W) % VIRTUAL_W</label>
+		</transition>
+		<transition id="id27">
+			<source ref="id25"/>
+			<target ref="id24"/>
+			<label kind="assignment" x="-45" y="30">carryFroggerIfNeeded(), t = 0</label>
+			<nail x="120" y="40"/>
+			<nail x="-200" y="40"/>
+		</transition>
+	</template>
+	<template>
+		<name>DivingCycle</name>
+		<declaration>// DivingCycle explicitly models the global cycle of diving turtles:
+// Emerged -&gt; Diving -&gt; Submerged -&gt; Emerging -&gt; Emerged.
+clock d;
+
+/**
+ * On the global state transition to SUBMERGED, if Frogger is in the river
+ * and riding a diving turtle, it dies by submersion (query VII flag).
+ * Otherwise, if it is not on a floating object or turtle gap, it dies by
+ * drowning. Called on the Diving -&gt; Submerged transition.
+ */
+void submergeFrogger() {
+    int i;
+    bool onDiving;
+    bool safe;
+    int ex;
+
+    if (frogY &gt;= WATER_ROW_MIN &amp;&amp; frogY &lt;= WATER_ROW_MAX) {
+        onDiving = false;
+        for (i = 0; i &lt; N_DIVING; i++) {
+            if (divingTurtles[i].row == frogY) {
+                ex = effective_x(divingTurtles[i].baseX, divingTurtles[i].row);
+                if (isVisible(ex) &amp;&amp; ex == frogX) onDiving = true;
+            }
+        }
+
+        if (onDiving) {
+            frogAlive = false;
+            last_death_cause = DEATH_SUBMERGED_TURTLE;
+            died_by_submerged_turtle = true;
+        } else {
+            safe = isOnAnyFloatingObject(frogX, frogY) || isBetweenTurtleGroup(frogX, frogY);
+            if (!safe) {
+                frogAlive = false;
+                last_death_cause = DEATH_WATER;
+            }
+        }
+    }
+    updateObservationFlags();
+}</declaration>
+		<location id="id28" x="-330" y="-80">
+			<name x="-340" y="-114">Emerged</name>
+			<label kind="invariant" x="-340" y="-63">d &lt;= div_duration[EMERGED]</label>
+		</location>
+		<location id="id29" x="-110" y="-80">
+			<name x="-120" y="-114">Diving</name>
+			<label kind="invariant" x="-120" y="-63">d &lt;= div_duration[DIVING_STATE]</label>
+		</location>
+		<location id="id30" x="110" y="-80">
+			<name x="100" y="-114">Submerged</name>
+			<label kind="invariant" x="100" y="-63">d &lt;= div_duration[SUBMERGED_STATE]</label>
+		</location>
+		<location id="id31" x="330" y="-80">
+			<name x="320" y="-114">Emerging</name>
+			<label kind="invariant" x="320" y="-63">d &lt;= div_duration[EMERGING_STATE]</label>
+		</location>
+		<init ref="id28"/>
+		<transition id="id32">
+			<source ref="id28"/>
+			<target ref="id29"/>
+			<label kind="guard" x="-290" y="-135">d == div_duration[EMERGED]</label>
+			<label kind="assignment" x="-290" y="-118">globalDivState = DIVING_STATE, d = 0</label>
+		</transition>
+		<transition id="id33">
+			<source ref="id29"/>
+			<target ref="id30"/>
+			<label kind="guard" x="-70" y="-135">d == div_duration[DIVING_STATE]</label>
+			<label kind="assignment" x="-70" y="-118">globalDivState = SUBMERGED_STATE, submergeFrogger(), d = 0</label>
+		</transition>
+		<transition id="id34">
+			<source ref="id30"/>
+			<target ref="id31"/>
+			<label kind="guard" x="150" y="-135">d == div_duration[SUBMERGED_STATE]</label>
+			<label kind="assignment" x="150" y="-118">globalDivState = EMERGING_STATE, d = 0</label>
+		</transition>
+		<transition id="id35">
+			<source ref="id31"/>
+			<target ref="id28"/>
+			<label kind="guard" x="-20" y="90">d == div_duration[EMERGING_STATE]</label>
+			<label kind="assignment" x="-20" y="107">globalDivState = EMERGED, d = 0</label>
+			<nail x="330" y="80"/>
+			<nail x="-330" y="80"/>
+		</transition>
+	</template>
+	<system>// ============================================
+// SYSTEM INSTANCES
+// ============================================
+
+manager = GameManager();
+frogger = Frogger();
+
+// Road rows
+road1 = VehicleLane(1);
+road2 = VehicleLane(2);
+road3 = VehicleLane(3);
+road4 = VehicleLane(4);
+road5 = VehicleLane(5);
+
+// River rows
+river7 = FloatingLane(7);
+river8 = FloatingLane(8);
+river9 = FloatingLane(9);
+river10 = FloatingLane(10);
+river11 = FloatingLane(11);
+
+// Global cycle of diving turtles
+diving = DivingCycle();
+
+// ============================================
+// SYSTEM COMPOSITION
+// Keep ONLY ONE system line active at a time.
+//
+// Queries I-II: use the system without Frogger and without GameManager.
+// Queries III-VII: use the full system.
+// ============================================
+
+// --- System WITHOUT Frogger/GameManager: use for queries I-II ---
+// system road1, road2, road3, road4, road5,
+//       river7, river8, river9, river10, river11,
+//       diving;
+
+// --- FULL system: use for queries III-VII ---
+system manager, frogger,
+      road1, road2, road3, road4, road5,
+     river7, river8, river9, river10, river11,
+      diving;</system>
+	<queries>
+		<query>
+			<formula>A[] not deadlock</formula>
+			<comment>I) Without considering Frogger: the environment composed of VehicleLane, FloatingLane and DivingCycle never reaches a deadlock. Verify by activating the system WITHOUT Frogger/GameManager.</comment>
+			<result outcome="success" type="quality" timestamp="2026-07-17 15:58:59 +0200">
+			</result>
+		</query>
+		<query>
+			<formula>A[] allObjectsStayInRows() &amp;&amp; allRowsHaveValidOffsets()</formula>
+			<comment>II) Without considering Frogger: vehicles and floating objects stay in their predefined row. Movement is modeled with per-row horizontal offsets, so only the horizontal position changes.</comment>
+			<result outcome="success" type="quality" timestamp="2026-07-17 15:59:16 +0200">
+			</result>
+		</query>
+		<query>
+			<formula>E&lt;&gt; reached_bay_0</formula>
+			<comment>III) Frogger can reach the leftmost bay, cells (0,12)-(1,12).</comment>
+			<result outcome="success" type="quality" timestamp="2026-07-16 22:54:06 +0200">
+			</result>
+		</query>
+		<query>
+			<formula>E&lt;&gt; reached_bay_2_with_17</formula>
+			<comment>IV) Frogger can reach the central bay (8,12)-(9,12) with exactly 17 points: 1 point per upward step + 5 for the free bay.</comment>
+			<result outcome="success" type="quality" timestamp="2026-07-16 22:54:11 +0200">
+			</result>
+		</query>
+		<query>
+			<formula>E&lt;&gt; reached_row_6_after_two_deaths</formula>
+			<comment>V) Frogger can reach a safe yellow cell in row 6 after the player has lost two lives.</comment>
+			<result outcome="success" type="quality" timestamp="2026-07-16 22:55:07 +0200">
+			</result>
+		</query>
+		<query>
+			<formula>E&lt;&gt; (globalClock &gt;= 100 &amp;&amp; lives == 5 &amp;&amp; isOnLog(frogX, frogY))</formula>
+			<comment>VI) Frogger can stand on a log with five lives at least 10 seconds after the game starts. 10 s = 100 t.u., measured by globalClock.</comment>
+			<result outcome="success" type="quality" timestamp="2026-07-16 23:01:17 +0200">
+			</result>
+		</query>
+		<query>
+			<formula>E&lt;&gt; died_by_submerged_turtle</formula>
+			<comment>VII) Frogger can die while riding a diving turtle when the cycle transitions to the submerged state.</comment>
+			<result outcome="success" type="quality" timestamp="2026-07-16 23:01:24 +0200">
+			</result>
+		</query>
+	</queries>
+</nta>
