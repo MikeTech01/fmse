@@ -315,8 +315,8 @@ bool isBetweenTurtleGroup(int x, int y) {
             if (divingTurtles[i].row == y) {
                 ex = effective_x(divingTurtles[i].baseX, divingTurtles[i].row);
                 if (isVisible(ex)) {
-                    if (((x - ex + COLS) % COLS) == 1) hasLeft = true;
-                    if (((ex - x + COLS) % COLS) == 1) hasRight = true;
+                    if (((x - ex + VIRTUAL_W) % VIRTUAL_W) == 1) hasLeft = true;
+                    if (((ex - x + VIRTUAL_W) % VIRTUAL_W) == 1) hasRight = true;
                 }
             }
         }
@@ -869,7 +869,7 @@ diving = DivingCycle();
 //       diving;
 
 // --- FULL system: use for queries III-VII ---
-system manager, frogger,
+ system manager, frogger,
       road1, road2, road3, road4, road5,
      river7, river8, river9, river10, river11,
       diving;</system>
@@ -877,43 +877,43 @@ system manager, frogger,
 		<query>
 			<formula>A[] not deadlock</formula>
 			<comment>I) Without considering Frogger: the environment composed of VehicleLane, FloatingLane and DivingCycle never reaches a deadlock. Verify by activating the system WITHOUT Frogger/GameManager.</comment>
-			<result outcome="success" type="quality" timestamp="2026-07-17 15:58:59 +0200">
+			<result outcome="success" type="quality" timestamp="2026-07-20 17:35:09 +0200">
 			</result>
 		</query>
 		<query>
 			<formula>A[] allObjectsStayInRows() &amp;&amp; allRowsHaveValidOffsets()</formula>
 			<comment>II) Without considering Frogger: vehicles and floating objects stay in their predefined row. Movement is modeled with per-row horizontal offsets, so only the horizontal position changes.</comment>
-			<result outcome="success" type="quality" timestamp="2026-07-17 15:59:16 +0200">
+			<result outcome="success" type="quality" timestamp="2026-07-20 17:35:24 +0200">
 			</result>
 		</query>
 		<query>
 			<formula>E&lt;&gt; reached_bay_0</formula>
 			<comment>III) Frogger can reach the leftmost bay, cells (0,12)-(1,12).</comment>
-			<result outcome="success" type="quality" timestamp="2026-07-16 22:54:06 +0200">
+			<result outcome="success" type="quality" timestamp="2026-07-20 16:12:29 +0200">
 			</result>
 		</query>
 		<query>
 			<formula>E&lt;&gt; reached_bay_2_with_17</formula>
 			<comment>IV) Frogger can reach the central bay (8,12)-(9,12) with exactly 17 points: 1 point per upward step + 5 for the free bay.</comment>
-			<result outcome="success" type="quality" timestamp="2026-07-16 22:54:11 +0200">
+			<result outcome="success" type="quality" timestamp="2026-07-20 16:12:41 +0200">
 			</result>
 		</query>
 		<query>
 			<formula>E&lt;&gt; reached_row_6_after_two_deaths</formula>
 			<comment>V) Frogger can reach a safe yellow cell in row 6 after the player has lost two lives.</comment>
-			<result outcome="success" type="quality" timestamp="2026-07-16 22:55:07 +0200">
+			<result outcome="success" type="quality" timestamp="2026-07-20 16:13:29 +0200">
 			</result>
 		</query>
 		<query>
 			<formula>E&lt;&gt; (globalClock &gt;= 100 &amp;&amp; lives == 5 &amp;&amp; isOnLog(frogX, frogY))</formula>
 			<comment>VI) Frogger can stand on a log with five lives at least 10 seconds after the game starts. 10 s = 100 t.u., measured by globalClock.</comment>
-			<result outcome="success" type="quality" timestamp="2026-07-16 23:01:17 +0200">
+			<result outcome="success" type="quality" timestamp="2026-07-20 16:18:49 +0200">
 			</result>
 		</query>
 		<query>
 			<formula>E&lt;&gt; died_by_submerged_turtle</formula>
 			<comment>VII) Frogger can die while riding a diving turtle when the cycle transitions to the submerged state.</comment>
-			<result outcome="success" type="quality" timestamp="2026-07-16 23:01:24 +0200">
+			<result outcome="success" type="quality" timestamp="2026-07-20 16:18:54 +0200">
 			</result>
 		</query>
 	</queries>

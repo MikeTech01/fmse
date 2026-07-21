@@ -74,16 +74,17 @@ const int FROG_START_X = 9;
 const int FROG_START_Y = 0;
 const int BASE_TIMEOUT = 300;
 
-// Strategy switch for SMC query II (spec §4.II "alternative movement strategy").
-//   false = baseline random walk (used by query I);
-//   true  = goal-biased safe-hop policy: canMoveTo() refuses unsafe cells
-//           (vehicle-covered, open water, deadly) AND a refused non-up hop
-//           falls back to frogMoveUp(), so the frog always attempts to
-//           progress toward the home row when its chosen direction is blocked.
-//           A behavioural bias towards safer rows / toward the goal, in the
-//           spirit of the spec's heuristic examples.
-// Toggle this constant in the declarations before running a query.
-const bool SMART_HEURISTIC = true;
+// Strategy switch for SMC queries (spec §4.I baseline, §4.II alternative).
+//   false = baseline random walk (default for Query I, spec §4.I);
+//   true  = goal-biased safe-hop policy (Query II, spec §4.II): canMoveTo()
+//           refuses unsafe cells (vehicle-covered, open water, deadly) AND
+//           a refused non-up hop falls back to frogMoveUp(), so the frog
+//           always attempts to progress toward the home row when its chosen
+//           direction is blocked. A behavioural bias toward safer rows /
+//           toward the goal, in the spirit of the spec's heuristic examples.
+// Default shipped value is false so Query I (the spec-required baseline
+// probability) is one-click runnable. Toggle to true before running Query II.
+const bool SMART_HEURISTIC = false;
 
 // High-level events between Frogger and GameManager.
 urgent broadcast chan frog_died;
@@ -561,9 +562,12 @@ clock roundClock;
 
 /**
  * Predicate: a candidate cell (nx,ny) is a legal destination for a single
- * hop. Rejects out-of-map coordinates and already-occupied bays. Under the
- * SMART_HEURISTIC strategy it also rejects unsafe cells (vehicles, open
- * water, deadly cells), implementing the alternative strategy of query II.
+ * hop. Rejects out-of-map coordinates and already-occupied bays. Active hops
+ * are confined to the visible map [0,COLS-1]x[0,ROWS-1]; the offscreen buffer
+ * columns [COLS,VIRTUAL_W-1] are reached only by floating-object carry
+ * (difficulty B), not by active movement. Under the SMART_HEURISTIC strategy
+ * it also rejects unsafe cells (vehicles, open water, deadly cells),
+ * implementing the alternative strategy of query II.
  * @param nx  candidate column
  * @param ny  candidate row
  * @return  true if Frogger may hop to (nx,ny), false otherwise
@@ -1056,7 +1060,7 @@ system manager, frogger,
 		</query>
 		<query>
 			<formula>simulate [&lt;=2000; 100] { score, lives, level, deaths_by_car, deaths_by_water, levels_completed }</formula>
-			<comment>II) (SMC, spec §4.II) Alternative movement strategy: set SMART_HEURISTIC = true so Frogger refuses to hop onto unsafe cells (bias towards safer rows / avoidance of drowning and vehicles). Simulate 2000 time units over 100 runs and analyze the trajectories of six aspects: points scored, lives left, current level, deaths by car, deaths by drowning, and number of levels completed.</comment>
+			<comment>II) (SMC, spec §4.II) Alternative movement strategy: set SMART_HEURISTIC = true so Frogger refuses to hop onto unsafe cells (bias towards safer rows / avoidance of drowning and vehicles), then re-run this query. Simulate 2000 time units over 100 runs and analyze the trajectories of six aspects: points scored, lives left, current level, deaths by car, deaths by drowning, and number of levels completed. WARNING: the stored plot below was produced with SMART_HEURISTIC = false (baseline) and will be overwritten once the query is re-run with the constant set to true.</comment>
 			<result outcome="success" type="quality" timestamp="2026-07-17 15:57:35 +0200">
 				<plot title="Simulations (100)" xaxis="time" yaxis="value">
 					<series title="score" type="l" color="0xff0000" encoding="csv">0.0,0.0
